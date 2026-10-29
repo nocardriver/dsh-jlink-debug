@@ -74,7 +74,7 @@ window.__ModuleLoader__.load({
       'panel.field.maxReadBytes': 'Max bytes per read',
       'panel.field.jlinkExe': 'JLink.exe',
       'panel.field.gdbServerExe': 'JLinkGDBServerCL.exe',
-      'panel.hint.device': 'Exact J-Link device name, e.g. STM32H503CB.',
+      'panel.hint.device': 'Search the J-Link device library, or type an exact name. Recent choices are one click away.',
       'panel.hint.interface': 'SWD uses two wires, JTAG five. Must match the wiring on the board.',
       'panel.hint.speedKhz': '4000 is safe on short wires; drop to 1000-2000 for a breadboard.',
       'panel.hint.idleCloseMs': '0 keeps the probe until the plugin unloads.',
@@ -83,6 +83,19 @@ window.__ModuleLoader__.load({
       'panel.global.title': 'J-Link runtime',
       'panel.global.intro': 'Machine-level settings. The chip, transport and clock belong to a workspace, so they moved to the J-Link panel in the right sidebar.',
       'panel.global.hint': 'Target settings live in the right sidebar: open it, add the J-Link tab from the guide, and set the chip, transport and clock for that workspace.',
+      'picker.search': 'Search device…',
+      'picker.recent': 'Recent',
+      'picker.matches': 'Matches',
+      'picker.loading': 'Reading the J-Link device library…',
+      'picker.none': 'No device matches',
+      'picker.pressEnter': 'Press Enter to use “{0}” as typed.',
+      'picker.hintEmpty': 'Type a chip name to search {0} devices.',
+      'picker.devices': '{0} devices',
+      'picker.library': 'J-Link library',
+      'picker.reload': 'Reload',
+      'picker.failed': 'Device list unavailable',
+      'picker.unknown': 'Not in the J-Link library: connecting fails unless a custom device is installed.',
+      'picker.alias': 'alias of {0}',
     }
 
     const ZH = {
@@ -154,6 +167,27 @@ window.__ModuleLoader__.load({
       'panel.global.title': 'J-Link 运行设置',
       'panel.global.intro': '本机级别的设置。芯片型号、调试接口和时钟按工作区区分，已经移到右侧边栏的 J-Link 面板。',
       'panel.global.hint': '目标设置现在在右侧边栏：打开它，从引导页添加 J-Link 标签，就可以为这个工作区设置芯片、接口和时钟。',
+      'picker.search': '搜索器件型号…',
+      'picker.recent': '最近使用',
+      'picker.matches': '搜索结果',
+      'picker.loading': '正在读取 J-Link 器件库…',
+      'picker.none': '没有匹配的器件',
+      'picker.pressEnter': '按回车直接使用「{0}」。',
+      'picker.hintEmpty': '输入型号搜索 {0} 个器件。',
+      'picker.devices': '{0} 个器件',
+      'picker.library': 'J-Link 器件库',
+      'picker.reload': '重新读取',
+      'picker.failed': '器件库不可用',
+      'picker.unknown': 'J-Link 器件库里没有这个型号：除非装了自定义器件，否则连接会失败。',
+      'picker.alias': '别名：{0}',
+    }
+
+    /** `{0}`-style substitution for the few labels that carry a count or name. */
+    function fill(text, ...values) {
+      return String(text).replace(/\{(\d+)\}/g, (whole, index) => {
+        const value = values[Number(index)]
+        return value === undefined ? whole : String(value)
+      })
     }
 
     const REG_ORDER = [
@@ -936,6 +970,385 @@ window.__ModuleLoader__.load({
       return draft
     }
 
+    // --------------------------------------------------------- device picker
+    //
+    // Asking the user to spell a J-Link device name from memory is the one
+    // place this panel demanded knowledge of a database. The picker searches
+    // the list the installed SEGGER software carries, and keeps the machine's
+    // recent choices one click away. A name the library does not know is still
+    // accepted: custom device files exist, and the Host already accepts them.
+
+    const D = {
+      wrap: { position: 'relative', display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
+      box: { position: 'relative', display: 'flex', alignItems: 'center', minWidth: 0 },
+      input: { ...R.input, padding: '0 26px 0 8px' },
+      chevron: {
+        position: 'absolute',
+        right: 6,
+        top: 0,
+        bottom: 0,
+        width: 16,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: 'var(--dsw-alias-label-secondary)',
+        pointerEvents: 'none',
+      },
+      status: { fontSize: 11.5, lineHeight: '16px', color: 'var(--dsw-alias-label-secondary)' },
+      statusOk: { fontSize: 11.5, lineHeight: '16px', color: 'var(--dsw-alias-state-success-primary)' },
+      statusBad: {
+        fontSize: 11.5,
+        lineHeight: '16px',
+        color: 'var(--dsw-alias-state-warn-primary)',
+        wordBreak: 'break-word',
+      },
+      menu: {
+        position: 'absolute',
+        top: 'calc(100% + 4px)',
+        left: 0,
+        right: 0,
+        zIndex: 30,
+        maxHeight: 280,
+        overflowY: 'auto',
+        overscrollBehavior: 'contain',
+        border: '1px solid var(--dsw-alias-border-l2)',
+        borderRadius: 8,
+        background: 'var(--dsw-alias-bg-overlay)',
+        padding: '4px 0',
+      },
+      section: {
+        padding: '6px 10px 2px',
+        fontSize: 10.5,
+        letterSpacing: '0.04em',
+        textTransform: 'uppercase',
+        color: 'var(--dsw-alias-label-secondary)',
+      },
+      row: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 1,
+        padding: '5px 10px',
+        cursor: 'pointer',
+        borderLeft: '2px solid transparent',
+      },
+      rowOn: {
+        background: 'var(--dsw-alias-bg-layer-2)',
+        borderLeftColor: 'var(--dsw-alias-brand-primary)',
+      },
+      name: {
+        fontFamily: MONO,
+        fontSize: 12.5,
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+      },
+      meta: {
+        fontSize: 10.5,
+        lineHeight: '14px',
+        color: 'var(--dsw-alias-label-secondary)',
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+      },
+      note: { padding: '8px 10px', fontSize: 11.5, lineHeight: '16px', color: 'var(--dsw-alias-label-secondary)' },
+      foot: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 8,
+        marginTop: 2,
+        padding: '5px 10px',
+        borderTop: '1px solid var(--dsw-alias-border-l1)',
+        background: 'var(--dsw-alias-bg-overlay)',
+        position: 'sticky',
+        bottom: 0,
+        fontSize: 10.5,
+        color: 'var(--dsw-alias-label-secondary)',
+      },
+      footText: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+      link: {
+        background: 'none',
+        border: 'none',
+        padding: 0,
+        font: 'inherit',
+        color: 'var(--dsw-alias-brand-primary)',
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+      },
+    }
+
+    function Chevron() {
+      return h('svg', {
+        width: 12,
+        height: 12,
+        viewBox: '0 0 12 12',
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 1.4,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        'aria-hidden': true,
+      }, h('path', { d: 'M2.5 4.5 6 8l3.5-3.5' }))
+    }
+
+    /** `vendor · core`, plus the base device when this is an alias. */
+    function deviceMeta(t, device) {
+      const parts = []
+      if (typeof device?.vendor === 'string' && device.vendor !== '') parts.push(device.vendor)
+      if (typeof device?.core === 'string' && device.core !== '') parts.push(device.core)
+      if (typeof device?.base === 'string' && device.base !== '') parts.push(fill(t('picker.alias'), device.base))
+      return parts.join(' · ')
+    }
+
+    /**
+     * The searchable device field.
+     *
+     * It owns no persisted state: the draft value stays in the parent, so a
+     * name typed by hand saves exactly like one picked from the list.
+     */
+    function DevicePicker(props) {
+      const t = props.t
+      const value = typeof props.value === 'string' ? props.value : ''
+      const disabled = props.disabled === true
+      const [open, setOpen] = React.useState(false)
+      const [focused, setFocused] = React.useState(false)
+      const [typed, setTyped] = React.useState(false)
+      const [response, setResponse] = React.useState(undefined)
+      const [busy, setBusy] = React.useState(false)
+      const [failure, setFailure] = React.useState(undefined)
+      const [cursor, setCursor] = React.useState(0)
+      const seq = React.useRef(0)
+      const alive = React.useRef(true)
+      const listRef = React.useRef(null)
+
+      React.useEffect(() => {
+        alive.current = true
+        return () => { alive.current = false }
+      }, [])
+
+      const endpoint = (query, refresh) => hostEndpoint('jlink-debug/devices')
+        + '?q=' + encodeURIComponent(query)
+        + '&limit=60'
+        + (refresh === true ? '&refresh=1' : '')
+
+      const load = async (query, refresh) => {
+        const id = ++seq.current
+        if (alive.current === true) setBusy(true)
+        try {
+          const reply = await fetch(endpoint(query, refresh), { cache: 'no-store' })
+          const data = await reply.json().catch(() => ({}))
+          if (id !== seq.current || alive.current !== true) return
+          if (reply.ok !== true || data.ok !== true) {
+            throw new Error(data.error ?? ('HTTP ' + String(reply.status)))
+          }
+          setResponse({ query, data })
+          setFailure(undefined)
+          setCursor(0)
+        } catch (error) {
+          if (id !== seq.current || alive.current !== true) return
+          setFailure(String(error?.message ?? error))
+        } finally {
+          if (id === seq.current && alive.current === true) setBusy(false)
+        }
+      }
+
+      // Search as the draft changes, including the initial value the Host
+      // loaded: that is what tells the panel whether the saved name is real.
+      React.useEffect(() => {
+        const query = value.trim()
+        const timer = setTimeout(() => { void load(query, false) }, 160)
+        return () => clearTimeout(timer)
+      }, [value])
+
+      const query = value.trim()
+      const data = response !== undefined && response.query === query ? response.data : undefined
+      const available = data?.available === true
+      const exact = data?.exact ?? null
+      const total = Number(data?.total ?? 0)
+      const matchedTotal = Number(data?.matched ?? 0)
+      const history = Array.isArray(data?.history) ? data.history : []
+      const matches = Array.isArray(data?.devices) ? data.devices : []
+      // Opening the field shows what was used before; typing narrows the
+      // library instead, so the two lists never compete for attention. A name
+      // already offered under "Recent" is not repeated under "Matches".
+      const showHistory = typed !== true || query === ''
+      const recent = history
+        .filter((device) => device !== null && typeof device === 'object' && typeof device.name === 'string')
+        .slice(0, showHistory ? 6 : 0)
+      const historyNames = new Set(recent.map((device) => device.name.toLowerCase()))
+      const visibleMatches = matches.filter((device) => !historyNames.has(String(device.name).toLowerCase()))
+      const rows = [...recent, ...visibleMatches]
+
+      const choose = (name) => {
+        props.onChange(name)
+        setOpen(false)
+        setCursor(0)
+      }
+
+      const onKeyDown = (event) => {
+        if (event.key === 'ArrowDown') {
+          event.preventDefault()
+          if (open !== true) {
+            setOpen(true)
+            return
+          }
+          if (rows.length > 0) setCursor((index) => (index + 1) % rows.length)
+          return
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault()
+          if (open !== true) {
+            setOpen(true)
+            return
+          }
+          if (rows.length > 0) setCursor((index) => (index - 1 + rows.length) % rows.length)
+          return
+        }
+        if (event.key === 'Enter') {
+          if (open === true && rows[cursor] !== undefined) {
+            event.preventDefault()
+            choose(rows[cursor].name)
+          } else {
+            setOpen(false)
+          }
+          return
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault()
+          setOpen(false)
+        }
+      }
+
+      // Keep the highlighted row inside the menu without measuring rows.
+      React.useEffect(() => {
+        if (open !== true) return
+        const list = listRef.current
+        if (list === null || typeof list.querySelector !== 'function') return
+        const row = list.querySelector('[data-selected="true"]')
+        if (row !== null && typeof row.scrollIntoView === 'function') {
+          row.scrollIntoView({ block: 'nearest' })
+        }
+      }, [open, cursor, response])
+
+      let status = null
+      if (failure !== undefined) {
+        status = h('div', { style: D.statusBad }, t('picker.failed') + ' · ' + failure)
+      } else if (data !== undefined && data.available === false) {
+        status = h('div', { style: D.statusBad }, t('picker.failed') + ' · ' + String(data.error ?? ''))
+      } else if (available === true && query !== '') {
+        // A half-typed name is not a mistake yet; only say "unknown" once the
+        // field is left and the value would be the one saved.
+        status = exact !== null
+          ? h('div', { style: D.statusOk }, '✓ ' + (deviceMeta(t, exact) || String(exact.name)))
+          : focused === true
+            ? null
+            : h('div', { style: D.statusBad }, t('picker.unknown'))
+      }
+
+      const row = (device, index) => h('div', {
+        key: 'row-' + String(device.name) + '-' + String(index),
+        role: 'option',
+        'aria-selected': index === cursor,
+        'data-selected': index === cursor ? 'true' : 'false',
+        style: index === cursor ? { ...D.row, ...D.rowOn } : D.row,
+        onMouseDown: (event) => {
+          event.preventDefault()
+          choose(device.name)
+        },
+        onMouseEnter: () => setCursor(index),
+      },
+        h('span', { style: D.name, title: String(device.name) }, String(device.name)),
+        deviceMeta(t, device) === ''
+          ? null
+          : h('span', { style: D.meta }, deviceMeta(t, device)))
+
+      const menu = open !== true ? null : h('div', {
+        style: D.menu,
+        ref: listRef,
+        role: 'listbox',
+        id: String(props.id) + '-list',
+      }, [
+        failure !== undefined
+          ? h('div', { key: 'broken', style: D.note }, t('picker.failed') + ': ' + failure)
+          : data !== undefined && data.available === false
+            ? h('div', { key: 'broken', style: D.note }, String(data.error ?? t('picker.failed')))
+            : null,
+        data === undefined && failure === undefined
+          ? h('div', { key: 'busy', style: D.note }, t('picker.loading'))
+          : null,
+        recent.length === 0
+          ? null
+          : h('div', { key: 'recent-head', style: D.section }, t('picker.recent')),
+        ...recent.map((device, index) => row(device, index)),
+        matches.length === 0
+          ? null
+          : visibleMatches.length === 0
+            ? null
+            : h('div', { key: 'match-head', style: D.section },
+                t('picker.matches') + (matchedTotal > 0 ? ' · ' + matchedTotal.toLocaleString() : '')),
+        ...visibleMatches.map((device, index) => row(device, recent.length + index)),
+        available === true && busy !== true && query !== '' && matches.length === 0
+          ? h('div', { key: 'none', style: D.note },
+              t('picker.none') + ' · ' + fill(t('picker.pressEnter'), query))
+          : null,
+        available === true && query === '' && recent.length === 0
+          ? h('div', { key: 'empty', style: D.note }, fill(t('picker.hintEmpty'), total.toLocaleString()))
+          : null,
+        h('div', { key: 'foot', style: D.foot },
+          h('span', { style: D.footText },
+            available === true
+              ? fill(t('picker.devices'), total.toLocaleString()) + (data?.jlink ? ' · ' + String(data.jlink) : '')
+              : t('picker.library')),
+          h('button', {
+            type: 'button',
+            style: D.link,
+            disabled,
+            onMouseDown: (event) => {
+              event.preventDefault()
+              void load(query, true)
+            },
+          }, t('picker.reload'))),
+      ])
+
+      return h('div', { style: D.wrap },
+        h('div', { style: D.box },
+          h('input', {
+            id: props.id,
+            type: 'text',
+            value,
+            placeholder: props.placeholder === undefined || props.placeholder === ''
+              ? t('picker.search')
+              : props.placeholder,
+            disabled,
+            spellCheck: false,
+            autoComplete: 'off',
+            role: 'combobox',
+            'aria-expanded': open === true,
+            'aria-autocomplete': 'list',
+            'aria-controls': String(props.id) + '-list',
+            style: D.input,
+            onChange: (event) => {
+              props.onChange(event.target.value)
+              setTyped(true)
+              setOpen(true)
+            },
+            onFocus: () => {
+              setFocused(true)
+              setTyped(false)
+              setOpen(true)
+            },
+            onClick: () => setOpen(true),
+            onBlur: () => {
+              setFocused(false)
+              window.setTimeout(() => setOpen(false), 120)
+            },
+            onKeyDown,
+          }),
+          h('span', { style: D.chevron }, h(Chevron, null)),
+          menu),
+        status)
+    }
+
     /**
      * The workspace's target form. It follows the session that owns the tab:
      * the Host resolves that session to a workspace and answers with the
@@ -1053,19 +1466,32 @@ window.__ModuleLoader__.load({
           placeholder: field.default === undefined ? '' : String(field.default),
           spellCheck: false,
         }
+        const isDevice = field.key === 'device'
         return h('div', { key: field.key, style: R.field },
           h('div', { key: 'label', style: R.labelRow },
             h('label', { htmlFor: control.id }, t('panel.field.' + field.key)),
             h('span', { style: R.tag }, t(field.override ? 'panel.override' : 'panel.default'))),
-          field.kind === 'select'
-            ? h('select', control, (field.options ?? []).map((option) =>
-              h('option', { key: option, value: option }, option)))
-            : h('input', {
-                ...control,
-                type: field.kind === 'number' ? 'number' : 'text',
-                min: field.min,
-                max: field.max,
-              }),
+          isDevice
+            ? h(DevicePicker, {
+                id: control.id,
+                value: control.value,
+                placeholder: control.placeholder,
+                disabled: control.disabled,
+                t,
+                onChange: (value) => {
+                  setDraft((current) => ({ ...current, device: value }))
+                  setNote(undefined)
+                },
+              })
+            : field.kind === 'select'
+              ? h('select', control, (field.options ?? []).map((option) =>
+                h('option', { key: option, value: option }, option)))
+              : h('input', {
+                  ...control,
+                  type: field.kind === 'number' ? 'number' : 'text',
+                  min: field.min,
+                  max: field.max,
+                }),
           hint === hintKey ? null : h('div', { key: 'hint', style: R.hint }, hint))
       })
 

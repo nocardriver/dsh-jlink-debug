@@ -18,6 +18,7 @@
     "session.js",
     "rsp.js",
     "elf.js",
+    "devices.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg"

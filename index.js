@@ -10,6 +10,14 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
+import {
+  describeDevice,
+  findDevice,
+  loadDeviceDatabase,
+  readDeviceHistory,
+  recordDeviceHistory,
+  searchDevices,
+} from './devices.js'
 import { findSymbol, loadSymbols, nearestSymbol } from './elf.js'
 import { findJLink, perform } from './jlink.js'
 import { ProbeSession } from './session.js'
@@ -20,6 +28,7 @@ export const inject = ['tools']
 const PACKAGE_NAME = '@nocardriver/dsh-jlink-debug'
 const CONFIG_PATH = '/jlink-debug/config'
 const WORKSPACE_PATH = '/jlink-debug/workspace'
+const DEVICES_PATH = '/jlink-debug/devices'
 
 /**
  * The fields that describe the attached target rather than this machine. A chip
@@ -553,6 +562,7 @@ export function apply(ctx, config = {}) {
 
     if (action === 'connect') {
       const info = await session.open({ halt: args?.halt === true })
+      void recordDeviceHistory(STATE_DIR, session.config.device)
       return { ok: true, action, session: 'open', state: info.state, probe: info.probe, summary: `attached · ${info.state}` }
     }
 
@@ -864,6 +874,7 @@ export function apply(ctx, config = {}) {
       try {
         const result = await perform(config, 'flash', { file: args?.file }, { halted: undefined })
         if (result.ok !== true) throw new Error(result.error ?? 'flash failed')
+        void recordDeviceHistory(STATE_DIR, config.device)
         // The image just programmed is the one the core runs, so it becomes the
         // workspace's symbol source — no separate setting to keep in sync.
         if (typeof result.file === 'string' && result.file.toLowerCase().endsWith('.elf')) {
@@ -1021,6 +1032,11 @@ export function apply(ctx, config = {}) {
         const keep = TARGET_FIELDS.some((field) => next[field] !== undefined) || next.elfFile !== undefined
         await writeWorkspace(workspace.key, keep ? next : undefined)
         const target = targetFor(baseline, next)
+        // Remember an explicit choice; clearing the overrides is not one. The
+        // write is awaited so the next dropdown open already lists it.
+        if (body?.reset !== true && typeof body?.patch?.device === 'string' && body.patch.device.trim() !== '') {
+          await recordDeviceHistory(STATE_DIR, target.device)
+        }
         const signature = targetSignature(target)
         if (session.isOpen && active?.workspace.key === workspace.key && active.signature !== signature) {
           // Saving a different board releases the probe; the next call attaches.
@@ -1038,6 +1054,77 @@ export function apply(ctx, config = {}) {
       }
       res.writeHead(405, { allow: 'GET, POST' })
       res.end()
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: String(error?.message ?? error) })
+    }
+  }
+
+  /**
+   * The J-Link device library, for the sidebar picker.
+   *
+   * SEGGER ships no plain list file; `devices.js` asks J-Link Commander to
+   * export the DLL's internal database and caches the parsed index beside the
+   * workspace state. The first request costs about a second, every later one
+   * is a lookup. `refresh=1` is the panel's explicit "re-read the library".
+   */
+  const handleDevicesRoute = async (req, res) => {
+    try {
+      if (req.method !== 'GET') {
+        res.writeHead(405, { allow: 'GET' })
+        res.end()
+        return
+      }
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const query = url.searchParams.get('q') ?? ''
+      const asked = Number(url.searchParams.get('limit') ?? 80)
+      const limit = Number.isFinite(asked) ? Math.min(Math.max(Math.trunc(asked), 1), 300) : 80
+      const refresh = url.searchParams.get('refresh') === '1'
+      const past = await readDeviceHistory(STATE_DIR)
+      const history = (database) => past.map((entry) => {
+        const found = findDevice(database, entry.name)
+        return present({
+          ...describeDevice(found),
+          // Prefer the spelling the library uses, so a lower-case choice from
+          // an older config still shows as the canonical name.
+          name: found === undefined ? entry.name : found.name,
+          at: entry.at,
+        })
+      })
+      let database
+      try {
+        const exe = await resolveExe()
+        database = await loadDeviceDatabase({
+          exe,
+          dir: STATE_DIR,
+          refresh,
+          timeoutMs: resolved.timeoutMs,
+        })
+      } catch (error) {
+        // A missing or broken J-Link install must not break the panel: it still
+        // accepts a name typed by hand, so the answer stays a normal document.
+        sendJson(res, 200, present({
+          ok: true,
+          available: false,
+          error: String(error?.message ?? error),
+          history: history(undefined),
+        }))
+        return
+      }
+      const exact = findDevice(database, query)
+      const found = searchDevices(database, query, limit)
+      sendJson(res, 200, present({
+        ok: true,
+        available: true,
+        source: database.exe,
+        jlink: database.jlink,
+        builtAt: database.builtAt,
+        cached: database.cached === true,
+        total: database.total,
+        matched: found.matched,
+        devices: found.items.map(describeDevice),
+        exact: exact === undefined ? null : describeDevice(exact),
+        history: history(database),
+      }))
     } catch (error) {
       sendJson(res, 400, { ok: false, error: String(error?.message ?? error) })
     }
@@ -1161,7 +1248,13 @@ export function apply(ctx, config = {}) {
       path: WORKSPACE_PATH,
       handler: handleWorkspaceRoute,
     })
+    const disposeDevices = webServer.register({
+      kind: 'exact',
+      path: DEVICES_PATH,
+      handler: handleDevicesRoute,
+    })
     return () => {
+      disposeDevices()
       disposeWorkspace()
       disposeConfig()
     }

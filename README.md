@@ -18,6 +18,7 @@ agent → read_memory(symbol: "SystemCoreClock")
 - **符号解析**。直接解析固件 `.elf` 的 `.symtab`，不用 `nm`/`objdump`/DWARF 工具链。可以 `breakpoint(symbol: "FDCAN_RxLogTask")`、`read_memory(symbol: "uwTick")`、省略长度时自动读整个变量。
 - **PC 自动符号化**。`registers` 直接给 `PC=0x080082BC FDCAN_RxLogTask+0`。
 - **按工作区的目标设置**。芯片型号、调试接口、时钟属于某一块板子，所以放在**右侧边栏 → J-Link** 面板里，每个工作区各存一份；`JLink.exe` 路径这类本机设置才留在全局设置页。
+- **器件库里搜索，不用背型号**。MCU 字段直接搜 J-Link 内置器件表（型号、厂商、内核、别名），下拉里还保留这台机器最近 12 个选择。
 - **对话内卡片**。寄存器网格、hexdump、符号表、烧录日志都在对话里渲染。
 - **连接不打扰目标**。attach 不复位内核；读内存只 halt 那一小会儿，读完恢复原来的运行状态。
 
@@ -26,7 +27,7 @@ agent → read_memory(symbol: "SystemCoreClock")
 | 项 | 说明 |
 |---|---|
 | 操作系统 | Windows。J-Link 的安装路径发现按 `C:\Program Files\SEGGER` 写死，Linux/macOS 需要改 `jlink.js` 里的 `SEGGER_ROOTS` |
-| SEGGER 软件 | 任意较新版本，需要 `JLink.exe` 与 `JLinkGDBServerCL.exe` |
+| SEGGER 软件 | 任意较新版本，需要 `JLink.exe` 与 `JLinkGDBServerCL.exe`。器件列表用 `ExpDevListXML` 导出；更老的版本会自动退回 `ExpDevList` 的 CSV |
 | DeepSeek Harness | 在 0.2.1-rc.3 上开发与验证 |
 | 硬件 | 任意 J-Link 探针 + 一块能连上的 MCU（本项目在 STM32H503CBU6 / Cortex-M33 上调通） |
 
@@ -62,7 +63,12 @@ pnpm install     # 或 npm install
 
 1. 打开右侧边栏（对话右上角的侧栏按钮，或默认快捷键）。
 2. 点标签栏末尾的 `+` 打开引导页，选 **J-Link 调试**；之后它就是一个常驻标签（布局按会话保存在浏览器里）。
-3. 填好 MCU / 器件型号、调试接口、时钟，点**保存**。
+3. 点 **MCU / 器件型号** 输入框：下拉里先是这台机器最近用过的型号，下面是 J-Link 器件库的搜索结果。输入任意片段即可过滤（大小写不敏感；空格分词，`stm32 h503` 和 `stm32h503` 都能搜到），每行带厂商和内核；`↑` / `↓` 选择、`Enter` 确认、`Esc` 关闭。库里没有的名字也可以直接输入。
+4. 设置调试接口和时钟，点**保存**。
+
+器件库来自已安装的 J-Link 软件：Host 让 `JLink.exe` 用 `ExpDevListXML` 把 DLL 内置的器件表导出来（本机 V9.52 是 27,959 个可选的器件名 / 别名），解析后缓存到 profile 目录下的 `jlink-debug/devices.json`。第一次打开面板约 1 秒，之后是一次查询；J-Link 升级后按 DLL 的修改时间自动重建，也可以点下拉底部的**重新读取**。搜不到时面板会提示"J-Link 器件库里没有这个型号"，但仍按你输入的值保存——自定义器件文件或器件包里的型号可以这样填。
+
+最近选择的型号存在同目录的 `history.json` 里（最多 12 个，按机器共享，不按工作区）：保存工作区设置、agent 首次 `connect`、`mcu_flash` 成功都会记一笔。下拉打开时"最近使用"一直在，不受当前输入影响。
 
 面板只对当前会话所属的工作区生效：换一个工作区，读到的就是那个工作区自己的值。每个字段旁标着 `默认`（跟随全局）或 `已覆盖`（本工作区自己的值）；**用全局默认**会清掉本工作区的覆盖。保存时如果探针正连在旧参数上，会先释放探针，下一次调用按新参数重新连接。
 
@@ -175,22 +181,26 @@ STM32H503CBU6（Cortex-M33 r0p4）+ J-Link，655 个符号 / 312 个函数 / 50 
 
 **冷启动时 `webServer` 还不存在。** 插件行比 Web 服务先挂载，启动时 `ctx.get('webServer')` 拿到的是 `undefined`，一次性的判断会静默跳过路由注册，结果工具能用、两个面板却全是 HTTP 404（要先手动重载插件才恢复）。路由必须走 `ctx.inject(['webServer'], ...)`，等服务出现再注册。
 
+**器件表不在文件里。** 新版 J-Link 安装目录里没有 `JLinkDevices.xml`，器件库在 DLL 内部；`JLink.exe` 的 `ExpDevListXML <文件名>` 是能拿到全表的入口（`ExpDevList` 只给基础器件，没有别名）。命令里的路径不能带空格——Commander 不剥引号，实测带空格会静默不写文件——所以导出时把子进程的工作目录设成临时目录、只传相对文件名。也验证过 GDB server 占着探针时导出仍然成功：Commander 先执行脚本命令，之后才去连探针。
+
 **Thumb 位。** ARM 的 `st_value` 对 Thumb 函数保留 bit 0（`main` 存 `0x080083E5`，`llvm-nm` 显示 `0x080083E4`）。所有对外地址都做 `& ~1`，`nearestSymbol` 也按偶数地址比较，否则每个函数的偏移都会多 1。
 
 ## 文件结构
 
 | 文件 | 作用 |
 |---|---|
-| `index.js` | Host 半边：两个工具、`Config` schema、工作区设置的读写与两条 HTTP 路由 |
+| `index.js` | Host 半边：两个工具、`Config` schema、工作区设置的读写与三条 HTTP 路由 |
+| `devices.js` | J-Link 器件库：`ExpDevListXML` 导出与解析、按安装缓存、搜索、最近选择 |
 | `jlink.js` | `JLink.exe` 命令行传输：身份/寄存器/内存/复位/烧录，以及安装路径发现 |
 | `session.js` | 持久会话：拉起 `JLinkGDBServerCL.exe`、halt/resume/step、断点、内存、FPB 清扫 |
 | `rsp.js` | 最小 GDB RSP 客户端（包分帧、ack、无超时的 `c`、`qRcmd`） |
 | `elf.js` | ELF32 小端符号表解析器，按 mtime 缓存，无第三方依赖 |
-| `client.js` | 客户端半边：对话卡片 + 右侧边栏的 J-Link 标签 + 全局设置页 |
+| `client.js` | 客户端半边：对话卡片 + 右侧边栏的 J-Link 标签（含器件搜索下拉）+ 全局设置页 |
 | `cordis.patch.yml` | 插件行与默认配置 |
 | `locale/*.json` | `meta.title` / `meta.description` |
 | `smoke.mjs` | 开发用的连通性冒烟脚本 |
 | `session-test.mjs` | 开发用的会话回归脚本 |
+| `devices-test.mjs` | 开发用的器件库脚本：导出、解析、缓存、搜索、历史 |
 
 ## 已知限制
 
@@ -208,6 +218,7 @@ STM32H503CBU6（Cortex-M33 r0p4）+ J-Link，655 个符号 / 312 个函数 / 50 
 ```bash
 node smoke.mjs        # 探针能不能找到、能不能连
 node session-test.mjs # 持久会话回归：halt/step/断点/内存/复位
+node devices-test.mjs # 器件库：导出耗时、解析条数、搜索排名、历史读写
 ```
 
 改了 Host 代码之后重载插件最快的方式，是在插件管理里关掉再打开——不用重启 DSH。
