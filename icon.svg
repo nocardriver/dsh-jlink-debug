@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="J-Link MCU debug">
+  <rect width="64" height="64" rx="14" fill="#0E2A3A"/>
+  <g stroke="#54D6B4" stroke-width="2.6" stroke-linecap="round">
+    <path d="M26 20 V13 M32 20 V13 M38 20 V13"/>
+    <path d="M26 44 V51 M32 44 V51 M38 44 V51"/>
+    <path d="M20 26 H13 M20 32 H13 M20 38 H13"/>
+    <path d="M44 26 H51 M44 32 H51 M44 38 H51"/>
+  </g>
+  <rect x="20" y="20" width="24" height="24" rx="3.5" fill="none" stroke="#54D6B4" stroke-width="2.6"/>
+  <path d="M32 27.5 v9 M27.5 32 h9" stroke="#FFB454" stroke-width="2.6" stroke-linecap="round"/>
+  <circle cx="32" cy="32" r="2.6" fill="#FFB454"/>
+</svg>

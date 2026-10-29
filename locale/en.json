@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "J-Link MCU Debug",
+    "description": "Debug, inspect and flash a microcontroller over SEGGER J-Link: connection options in a settings form, then registers, memory and breakpoints by name from the firmware symbol table, single-step and firmware download, with cards rendered in the conversation."
+  }
+}

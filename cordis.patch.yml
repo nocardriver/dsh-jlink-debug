@@ -1,0 +1,8 @@
+- insert:
+    - id: jlink-debug
+      name: '@nocardriver/dsh-jlink-debug'
+      config:
+        device: STM32H503CB
+        interface: SWD
+        speedKhz: 4000
+        maxReadBytes: 512
