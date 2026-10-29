@@ -45,15 +45,24 @@ window.__ModuleLoader__.load({
       'field.candidates': 'Candidates',
       'hint.running': 'Querying the probe…',
       'panel.nav': 'J-Link Debug',
-      'panel.title': 'J-Link connection',
-      'panel.intro': 'How the agent reaches the target. Saving rewrites this plugin\'s configuration and restarts it, so an open debug session ends.',
+      'panel.tab': 'J-Link',
+      'panel.guide.description': 'Device, transport and clock for this workspace',
+      'panel.title': 'Target connection',
+      'panel.intro': 'These values belong to this workspace only. The agent attaches with them, and a different workspace keeps its own board.',
+      'panel.workspace': 'Workspace',
+      'panel.directory': 'unregistered folder',
       'panel.save': 'Save',
       'panel.refresh': 'Refresh',
       'panel.saving': 'Saving…',
-      'panel.saved': 'Saved and applied.',
+      'panel.saved': 'Saved for this workspace.',
       'panel.pending': 'Saved, waiting for the plugin to restart…',
       'panel.saveFailed': 'The new values did not take effect.',
       'panel.loadFailed': 'Cannot reach the plugin host route.',
+      'panel.noSession': 'Open a session first: the panel follows the workspace that session belongs to.',
+      'panel.reset': 'Use defaults',
+      'panel.resetDone': 'Workspace values cleared; the global defaults apply again.',
+      'panel.default': 'default',
+      'panel.override': 'workspace',
       'panel.status': 'Session',
       'panel.session.open': 'attached',
       'panel.session.closed': 'probe released',
@@ -66,10 +75,14 @@ window.__ModuleLoader__.load({
       'panel.field.jlinkExe': 'JLink.exe',
       'panel.field.gdbServerExe': 'JLinkGDBServerCL.exe',
       'panel.hint.device': 'Exact J-Link device name, e.g. STM32H503CB.',
+      'panel.hint.interface': 'SWD uses two wires, JTAG five. Must match the wiring on the board.',
       'panel.hint.speedKhz': '4000 is safe on short wires; drop to 1000-2000 for a breadboard.',
       'panel.hint.idleCloseMs': '0 keeps the probe until the plugin unloads.',
       'panel.hint.jlinkExe': 'Empty auto-detects the newest SEGGER install.',
       'panel.hint.gdbServerExe': 'Empty auto-detects beside JLink.exe.',
+      'panel.global.title': 'J-Link runtime',
+      'panel.global.intro': 'Machine-level settings. The chip, transport and clock belong to a workspace, so they moved to the J-Link panel in the right sidebar.',
+      'panel.global.hint': 'Target settings live in the right sidebar: open it, add the J-Link tab from the guide, and set the chip, transport and clock for that workspace.',
     }
 
     const ZH = {
@@ -103,15 +116,24 @@ window.__ModuleLoader__.load({
       'field.candidates': '候选',
       'hint.running': '正在查询探针…',
       'panel.nav': 'J-Link 调试',
-      'panel.title': 'J-Link 连接',
-      'panel.intro': 'Agent 连接目标的方式。保存会重写这个插件的配置并重启它，正在进行的调试会话会结束。',
+      'panel.tab': 'J-Link',
+      'panel.guide.description': '当前工作区的器件、接口与时钟',
+      'panel.title': '目标连接',
+      'panel.intro': '只对当前工作区生效。Agent 用这些值连接目标，换个工作区就换自己的板子。',
+      'panel.workspace': '工作区',
+      'panel.directory': '未注册的目录',
       'panel.save': '保存',
       'panel.refresh': '刷新',
       'panel.saving': '保存中…',
-      'panel.saved': '已保存并生效。',
+      'panel.saved': '已保存到当前工作区。',
       'panel.pending': '已提交，等待插件重启…',
       'panel.saveFailed': '新值没有生效。',
       'panel.loadFailed': '无法连接插件的 Host 路由。',
+      'panel.noSession': '请先打开一个会话：这个面板跟随会话所属的工作区。',
+      'panel.reset': '用全局默认',
+      'panel.resetDone': '已清除工作区设置，改用全局默认。',
+      'panel.default': '默认',
+      'panel.override': '已覆盖',
       'panel.status': '会话',
       'panel.session.open': '已连接',
       'panel.session.closed': '探针已释放',
@@ -124,10 +146,14 @@ window.__ModuleLoader__.load({
       'panel.field.jlinkExe': 'JLink.exe',
       'panel.field.gdbServerExe': 'JLinkGDBServerCL.exe',
       'panel.hint.device': 'J-Link 器件库里的一模一样的名字，例如 STM32H503CB。',
+      'panel.hint.interface': 'SWD 两线、JTAG 五线，必须和板子上的接法一致。',
       'panel.hint.speedKhz': '短线 4000 可靠；面包板建议降到 1000–2000。',
       'panel.hint.idleCloseMs': '0 表示插件卸载前一直占着探针。',
       'panel.hint.jlinkExe': '留空则自动找最新的 SEGGER 安装。',
       'panel.hint.gdbServerExe': '留空则在 JLink.exe 旁边自动找。',
+      'panel.global.title': 'J-Link 运行设置',
+      'panel.global.intro': '本机级别的设置。芯片型号、调试接口和时钟按工作区区分，已经移到右侧边栏的 J-Link 面板。',
+      'panel.global.hint': '目标设置现在在右侧边栏：打开它，从引导页添加 J-Link 标签，就可以为这个工作区设置芯片、接口和时钟。',
     }
 
     const REG_ORDER = [
@@ -662,8 +688,8 @@ window.__ModuleLoader__.load({
       }
 
       const children = [
-        h('div', { key: 'title', style: P.title }, t('panel.title')),
-        h('div', { key: 'intro', style: P.intro }, t('panel.intro')),
+        h('div', { key: 'title', style: P.title }, t('panel.global.title')),
+        h('div', { key: 'intro', style: P.intro }, t('panel.global.intro')),
       ]
 
       if (phase === 'error') {
@@ -723,6 +749,8 @@ window.__ModuleLoader__.load({
           style: note === t('panel.saved') ? P.good : P.note,
         }, note)))
 
+      children.push(h('div', { key: 'moved', style: P.hint }, t('panel.global.hint')))
+
       if (status !== undefined) {
         const elf = status.elf ?? {}
         const sessionText = status.session === 'open'
@@ -741,6 +769,408 @@ window.__ModuleLoader__.load({
       }
 
       return h('div', { style: P.page }, children)
+    }
+
+    // ------------------------------------------------------ right sidebar tab
+    //
+    // The target belongs to a workspace, not to the whole application, so its
+    // form lives in the right sidebar beside the conversation that drives it.
+    // The right column owns tab types and navigation; this plugin contributes
+    // one type and registers its body under that type's own id.
+
+    /** Tab type id: the registry key, and the body/title slot key. */
+    const TAB_TYPE_ID = '@nocardriver/dsh-jlink-debug/panel'
+    /** The kind a guide row opens and `openTab` addresses. */
+    const TAB_KIND = 'jlink-debug'
+
+    /** Narrow-column styling: label above control, no fixed label column. */
+    const R = {
+      page: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+        padding: '12px 12px 24px',
+        minWidth: 0,
+        color: 'var(--dsw-alias-label-primary)',
+      },
+      head: { display: 'flex', alignItems: 'center', gap: 8 },
+      title: { fontSize: 13, fontWeight: 600 },
+      intro: { fontSize: 12, lineHeight: '17px', color: 'var(--dsw-alias-label-secondary)' },
+      workspaceRow: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
+      workspaceName: {
+        fontSize: 12,
+        fontWeight: 600,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      },
+      card: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+        border: '1px solid var(--dsw-alias-border-l1)',
+        borderRadius: 10,
+        background: 'var(--dsw-alias-bg-layer-1)',
+        padding: '12px',
+      },
+      field: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
+      labelRow: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        fontSize: 12,
+        color: 'var(--dsw-alias-label-secondary)',
+      },
+      tag: {
+        fontSize: 10.5,
+        lineHeight: '16px',
+        padding: '0 6px',
+        borderRadius: 999,
+        border: '1px solid var(--dsw-alias-border-l1)',
+        color: 'var(--dsw-alias-label-secondary)',
+        whiteSpace: 'nowrap',
+      },
+      input: {
+        width: '100%',
+        boxSizing: 'border-box',
+        height: 30,
+        padding: '0 8px',
+        fontSize: 12.5,
+        fontFamily: MONO,
+        color: 'var(--dsw-alias-label-primary)',
+        background: 'var(--dsw-alias-bg-layer-2)',
+        border: '1px solid var(--dsw-alias-border-l1)',
+        borderRadius: 6,
+        outline: 'none',
+      },
+      hint: { fontSize: 11.5, lineHeight: '16px', color: 'var(--dsw-alias-label-secondary)' },
+      actions: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' },
+      button: {
+        height: 30,
+        padding: '0 12px',
+        fontSize: 12.5,
+        borderRadius: 6,
+        border: '1px solid var(--dsw-alias-border-l1)',
+        background: 'var(--dsw-alias-bg-layer-1)',
+        color: 'var(--dsw-alias-label-primary)',
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+      },
+      primary: {
+        height: 30,
+        padding: '0 14px',
+        fontSize: 12.5,
+        borderRadius: 6,
+        border: '1px solid var(--dsw-alias-brand-primary)',
+        background: 'var(--dsw-alias-brand-primary)',
+        color: 'var(--dsw-alias-label-inverse, #fff)',
+        cursor: 'pointer',
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+      },
+      status: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 3,
+        fontSize: 12,
+        color: 'var(--dsw-alias-label-secondary)',
+      },
+      mono: { fontFamily: MONO, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+      good: { fontSize: 12, lineHeight: '17px', color: 'var(--dsw-alias-state-success-primary)' },
+      bad: {
+        fontSize: 12,
+        lineHeight: '17px',
+        color: 'var(--dsw-alias-state-error-primary)',
+        wordBreak: 'break-word',
+      },
+      note: {
+        fontSize: 12,
+        lineHeight: '17px',
+        color: 'var(--dsw-alias-label-secondary)',
+        wordBreak: 'break-word',
+      },
+    }
+
+    /** A chip glyph for the guide card and the tab title. */
+    function JLinkIcon(props) {
+      const size = props !== null && typeof props === 'object' && typeof props.size === 'number' ? props.size : 16
+      return h('svg', {
+        width: size,
+        height: size,
+        viewBox: '0 0 16 16',
+        'aria-hidden': true,
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 1.2,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+      },
+        h('rect', { key: 'chip', x: 4.6, y: 4.6, width: 6.8, height: 6.8, rx: 1.3 }),
+        h('path', {
+          key: 'pins',
+          d: 'M6.3 1.6v3M9.7 1.6v3M6.3 11.4v3M9.7 11.4v3M1.6 6.3h3M1.6 9.7h3M11.4 6.3h3M11.4 9.7h3',
+        }),
+        h('circle', { key: 'dot', cx: 8, cy: 8, r: 1.1, fill: 'currentColor', stroke: 'none' }))
+    }
+
+    /** Same-origin URL of one Host route, honouring a mounted base path. */
+    function hostEndpoint(path) {
+      try {
+        return new URL(path, new URL('.', location.href)).toString()
+      } catch {
+        return '/' + path
+      }
+    }
+
+    function workspaceEndpoint(sessionId) {
+      const base = hostEndpoint('jlink-debug/workspace')
+      return sessionId === '' ? base : base + '?session=' + encodeURIComponent(sessionId)
+    }
+
+    /** Turn a Host state document into the editable draft. */
+    function draftFromState(state) {
+      const draft = {}
+      for (const field of Array.isArray(state?.fields) ? state.fields : []) {
+        draft[field.key] = field.value === undefined || field.value === null ? '' : String(field.value)
+      }
+      return draft
+    }
+
+    /**
+     * The workspace's target form. It follows the session that owns the tab:
+     * the Host resolves that session to a workspace and answers with the
+     * effective values plus which of them override the global default.
+     */
+    function TargetPanel(props) {
+      const t = props.t
+      const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
+      const [phase, setPhase] = React.useState('loading')
+      const [state, setState] = React.useState(undefined)
+      const [draft, setDraft] = React.useState({})
+      const [note, setNote] = React.useState(undefined)
+      const alive = React.useRef(true)
+
+      React.useEffect(() => {
+        alive.current = true
+        return () => { alive.current = false }
+      }, [])
+
+      const adopt = React.useCallback((data) => {
+        setState(data)
+        setDraft(draftFromState(data))
+        setPhase('ready')
+      }, [])
+
+      const load = React.useCallback(async () => {
+        if (sessionId === '') {
+          setPhase('error')
+          setNote(t('panel.noSession'))
+          return
+        }
+        setPhase('loading')
+        try {
+          const response = await fetch(workspaceEndpoint(sessionId), { cache: 'no-store' })
+          const data = await response.json().catch(() => ({}))
+          if (response.ok !== true || data.ok !== true) {
+            throw new Error(data.error ?? ('HTTP ' + String(response.status)))
+          }
+          if (alive.current !== true) return
+          adopt(data)
+        } catch (error) {
+          if (alive.current !== true) return
+          setPhase('error')
+          setNote(String(error?.message ?? error))
+        }
+      }, [adopt, sessionId, t])
+
+      React.useEffect(() => { void load() }, [load])
+
+      const submit = async (body, success) => {
+        setPhase('saving')
+        setNote(undefined)
+        try {
+          const response = await fetch(workspaceEndpoint(sessionId), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ session: sessionId, ...body }),
+          })
+          const data = await response.json().catch(() => ({}))
+          if (response.ok !== true || data.ok !== true) {
+            throw new Error(data.error ?? ('HTTP ' + String(response.status)))
+          }
+          if (alive.current !== true) return
+          adopt(data)
+          setNote(success)
+        } catch (error) {
+          if (alive.current !== true) return
+          setPhase('ready')
+          setNote(String(error?.message ?? error))
+        }
+      }
+
+      const children = [
+        h('div', { key: 'title', style: R.title }, t('panel.title')),
+        h('div', { key: 'intro', style: R.intro }, t('panel.intro')),
+      ]
+
+      if (phase === 'error') {
+        children.push(h('div', { key: 'err', style: R.bad }, String(note ?? t('panel.loadFailed'))))
+        children.push(h('div', { key: 'retry', style: R.actions },
+          h('button', { type: 'button', style: R.button, onClick: () => { void load() } }, t('panel.refresh'))))
+        return h('div', { style: R.page }, children)
+      }
+
+      const workspace = state?.workspace
+      if (workspace !== undefined) {
+        children.push(h('div', { key: 'ws', style: R.workspaceRow },
+          h('span', { key: 'label', style: R.tag }, t('panel.workspace')),
+          h('span', { key: 'name', style: R.workspaceName, title: workspace.path },
+            String(workspace.title || workspace.path || t('panel.directory'))),
+          workspace.source === 'directory'
+            ? h('span', { key: 'src', style: R.tag }, t('panel.directory'))
+            : null))
+      }
+
+      const fields = Array.isArray(state?.fields) ? state.fields : []
+      if (phase === 'loading' && fields.length === 0) {
+        children.push(h('div', { key: 'loading', style: R.intro }, t('hint.running')))
+        return h('div', { style: R.page }, children)
+      }
+
+      const rows = fields.map((field) => {
+        const hintKey = 'panel.hint.' + field.key
+        const hint = t(hintKey)
+        const control = {
+          id: 'jlink-ws-' + field.key,
+          value: draft[field.key] === undefined ? '' : draft[field.key],
+          onChange: (event) => {
+            const value = event.target.value
+            setDraft((current) => ({ ...current, [field.key]: value }))
+            setNote(undefined)
+          },
+          style: R.input,
+          disabled: phase === 'saving',
+          placeholder: field.default === undefined ? '' : String(field.default),
+          spellCheck: false,
+        }
+        return h('div', { key: field.key, style: R.field },
+          h('div', { key: 'label', style: R.labelRow },
+            h('label', { htmlFor: control.id }, t('panel.field.' + field.key)),
+            h('span', { style: R.tag }, t(field.override ? 'panel.override' : 'panel.default'))),
+          field.kind === 'select'
+            ? h('select', control, (field.options ?? []).map((option) =>
+              h('option', { key: option, value: option }, option)))
+            : h('input', {
+                ...control,
+                type: field.kind === 'number' ? 'number' : 'text',
+                min: field.min,
+                max: field.max,
+              }),
+          hint === hintKey ? null : h('div', { key: 'hint', style: R.hint }, hint))
+      })
+
+      if (rows.length > 0) children.push(h('div', { key: 'form', style: R.card }, rows))
+
+      children.push(h('div', { key: 'actions', style: R.actions },
+        h('button', {
+          key: 'save',
+          type: 'button',
+          style: { ...R.primary, opacity: phase === 'saving' ? 0.6 : 1 },
+          disabled: phase === 'saving' || rows.length === 0,
+          onClick: () => { void submit({ patch: draft }, t('panel.saved')) },
+        }, phase === 'saving' ? t('panel.saving') : t('panel.save')),
+        h('button', {
+          key: 'reset',
+          type: 'button',
+          style: R.button,
+          disabled: phase === 'saving',
+          onClick: () => { void submit({ reset: true }, t('panel.resetDone')) },
+        }, t('panel.reset')),
+        h('button', {
+          key: 'refresh',
+          type: 'button',
+          style: R.button,
+          disabled: phase === 'saving',
+          onClick: () => { void load() },
+        }, t('panel.refresh'))))
+
+      if (note !== undefined) {
+        const positive = note === t('panel.saved') || note === t('panel.resetDone')
+        children.push(h('div', { key: 'note', style: positive ? R.good : R.note }, note))
+      }
+
+      if (state !== undefined) {
+        const info = state.session ?? { open: false }
+        const sessionText = info.open === true
+          ? t('panel.session.open') + (info.state === undefined ? '' : ' · ' + String(info.state))
+          : t('panel.session.closed')
+        const elf = state.elf ?? {}
+        const hasImage = typeof elf.file === 'string' && elf.file !== ''
+        children.push(h('div', { key: 'status', style: R.status },
+          h('span', { key: 's' }, t('panel.status') + ': ' + sessionText),
+          h('span', { key: 'e' }, t('panel.symbols') + ': '
+            + (hasImage ? String(elf.symbols ?? 0) + ' / ' + String(elf.functions ?? 0) : '—')),
+          hasImage
+            ? h('span', { key: 'f', style: R.mono, title: elf.file },
+                String(elf.file).split(/[\\/]/).pop())
+            : null))
+      }
+
+      return h('div', { style: R.page }, children)
+    }
+
+    /**
+     * Register the target form as a native right-sidebar tab type.
+     *
+     * The native seat declares `sidebar.right.pane.tab` before it provides
+     * `sidebarRightTabs`, so the service has to be awaited through `ctx.inject`
+     * instead of read while the slot declaration is being handled.
+     */
+    function registerRightSidebarTab(ctx, t) {
+      return ctx.inject(['sidebarRightTabs'], (scoped) => {
+        const tabs = scoped.get('sidebarRightTabs')
+        if (tabs === undefined) return undefined
+        const disposers = []
+        const release = () => {
+          for (const dispose of disposers.reverse()) {
+            try {
+              dispose()
+            } catch {
+              // Already released.
+            }
+          }
+        }
+        try {
+          disposers.push(tabs.register({
+            id: TAB_TYPE_ID,
+            kind: TAB_KIND,
+            title: () => t('panel.tab'),
+            guide: [{
+              id: TAB_KIND,
+              order: 40,
+              title: () => t('panel.nav'),
+              description: () => t('panel.guide.description'),
+              icon: (iconProps) => h(JLinkIcon, {
+                size: iconProps !== null && typeof iconProps === 'object' && typeof iconProps.size === 'number'
+                  ? iconProps.size
+                  : 16,
+              }),
+            }],
+          }))
+          disposers.push(ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register(
+            { name: 'sidebar.right.pane.tab', key: TAB_TYPE_ID },
+            (props) => h(TargetPanel, { ...props, t }),
+          )))
+          disposers.push(ctx.slots.inject('sidebar.right.pane.tab.title', () => ctx.slots.register(
+            { name: 'sidebar.right.pane.tab.title', key: TAB_TYPE_ID },
+            () => h('span', { style: { whiteSpace: 'nowrap' } }, t('panel.tab')),
+          )))
+        } catch (error) {
+          release()
+          throw error
+        }
+        return release
+      })
     }
 
     return {
@@ -773,12 +1203,16 @@ window.__ModuleLoader__.load({
           { name: 'tool.call.toolview', key: 'mcu_flash' },
           (props) => h(Card, { ...props, t }),
         ))
-        // The connection form: its own row in Settings, where a user looks for
-        // plugin configuration.
+        // Machine-level settings: the probe binaries and the tool limits.
         ctx.slots.inject('settings.section', () => ctx.slots.register(
           { name: 'settings.section', id: 'jlink-debug', order: 55, label: () => t('panel.nav') },
           () => h(SettingsPanel, { t }),
         ))
+        // Per-workspace target settings: a native tab in the right sidebar.
+        const seat = registerRightSidebarTab(ctx, t)
+        ctx.effect(() => () => {
+          if (seat !== undefined && typeof seat.dispose === 'function') seat.dispose()
+        }, 'jlink-debug-right-tab')
       },
     }
   },

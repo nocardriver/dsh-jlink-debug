@@ -6,6 +6,9 @@
  * `mcu_flash` is separate because programming is destructive and needs the
  * probe released, which means the session has to be closed first.
  */
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { basename, join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 import { findSymbol, loadSymbols, nearestSymbol } from './elf.js'
 import { findJLink, perform } from './jlink.js'
@@ -16,6 +19,25 @@ export const inject = ['tools']
 /** Must match package.json `name`: the settings panel and its route key off it. */
 const PACKAGE_NAME = '@nocardriver/dsh-jlink-debug'
 const CONFIG_PATH = '/jlink-debug/config'
+const WORKSPACE_PATH = '/jlink-debug/workspace'
+
+/**
+ * The fields that describe the attached target rather than this machine. A chip
+ * model, a transport and a clock belong to one board, so each workspace owns
+ * its own values and the global config only supplies the fallback default.
+ */
+const TARGET_FIELDS = ['device', 'interface', 'speedKhz']
+
+/**
+ * Per-workspace values are stored beside the harness home, never inside the
+ * workspace: a debug setting must not show up in the user's `git status`. The
+ * Host may not carry a profile variable, so `DSH_HOME` is the usual base.
+ */
+const STATE_DIR = join(
+  process.env.DSH_PROFILE_DIR ?? process.env.DSH_HOME ?? join(homedir(), '.dsh'),
+  'jlink-debug',
+)
+const STATE_FILE = join(STATE_DIR, 'workspaces.json')
 
 const DEFAULTS = {
   device: 'STM32H503CB',
@@ -178,6 +200,49 @@ function describeCall(args) {
   return { card: 'generic', title: `MCU ${action}`, kind: 'other' }
 }
 
+/**
+ * Keep only what this file writes and understands. A hand-edited or
+ * older-version file must not be able to inject values into a probe command.
+ */
+function normalizeWorkspaceEntry(raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const entry = {}
+  if (typeof raw.path === 'string' && raw.path !== '') entry.path = raw.path
+  if (typeof raw.title === 'string') entry.title = raw.title
+  if (typeof raw.device === 'string' && raw.device.trim() !== '') entry.device = raw.device.trim()
+  if (raw.interface === 'SWD' || raw.interface === 'JTAG') entry.interface = raw.interface
+  if (typeof raw.speedKhz === 'number' && Number.isFinite(raw.speedKhz)) entry.speedKhz = raw.speedKhz
+  if (typeof raw.elfFile === 'string' && raw.elfFile !== '') entry.elfFile = raw.elfFile
+  if (typeof raw.updatedAt === 'string') entry.updatedAt = raw.updatedAt
+  return entry
+}
+
+/** Compare Windows paths the way the filesystem does: case-insensitively. */
+function foldPath(value) {
+  return String(value).replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase()
+}
+
+/** Whether `child` is `parent` itself or sits below it. */
+function pathContains(parent, child) {
+  const outer = foldPath(parent)
+  const inner = foldPath(child)
+  if (outer === '' || inner === '') return false
+  return inner === outer || inner.startsWith(`${outer}\\`)
+}
+
+/** The effective target: the workspace's values over the global defaults. */
+function targetFor(defaults, entry) {
+  return {
+    device: entry?.device ?? defaults.device,
+    interface: entry?.interface ?? defaults.interface,
+    speedKhz: entry?.speedKhz ?? defaults.speedKhz,
+  }
+}
+
+function targetSignature(target) {
+  return `${target.device}|${target.interface}|${target.speedKhz}`
+}
+
 export function apply(ctx, config = {}) {
   // The config form cannot express "unset", so an empty text field arrives as
   // ''. Treat it as absent; otherwise `jlinkExe: ''` would disable auto-detect.
@@ -192,10 +257,121 @@ export function apply(ctx, config = {}) {
   const session = new ProbeSession(resolved)
   let pendingExe
   let idleTimer
-  /** Parsed .elf symbol table, or undefined while no usable image is configured. */
+  /** Parsed .elf symbol table, and the image it was parsed from. */
   let symbols
+  let symbolsSource
   /** Why the last symbol load failed; kept so `status` can explain an empty lookup. */
   let symbolsError
+  /** The workspace and target the current call, and the live session, belong to. */
+  let active
+
+  // ------------------------------------------------------------ workspace state
+  //
+  // Target settings are per workspace: one probe is shared, but each project
+  // has its own board, transport and clock. They live in one JSON file beside
+  // the profile, so the tools, the right-sidebar panel and a restart all read
+  // the same values.
+
+  let store
+  let storeWrites = Promise.resolve()
+
+  const readStore = async () => {
+    if (store !== undefined) return store
+    try {
+      const parsed = JSON.parse(await readFile(STATE_FILE, 'utf8'))
+      const workspaces = {}
+      for (const [key, value] of Object.entries(parsed?.workspaces ?? {})) {
+        const entry = normalizeWorkspaceEntry(value)
+        if (entry !== undefined) workspaces[key] = entry
+      }
+      store = { version: 1, workspaces }
+    } catch {
+      // Absent, unreadable or corrupt: start empty rather than fail the call.
+      store = { version: 1, workspaces: {} }
+    }
+    return store
+  }
+
+  const readWorkspace = async (key) => (await readStore()).workspaces[key]
+
+  /** Queue a durable write; a failed write must not fail the current call. */
+  const writeWorkspace = (key, entry) => {
+    storeWrites = storeWrites.then(async () => {
+      const state = await readStore()
+      if (entry === undefined) {
+        delete state.workspaces[key]
+      } else {
+        state.workspaces[key] = normalizeWorkspaceEntry({
+          ...entry,
+          updatedAt: new Date().toISOString(),
+        })
+      }
+      await mkdir(STATE_DIR, { recursive: true })
+      const temp = `${STATE_FILE}.tmp`
+      await writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+      await rename(temp, STATE_FILE)
+    }).catch(() => {})
+    return storeWrites
+  }
+
+  /**
+   * Which workspace a session belongs to. The registry's session index is
+   * authoritative; a session that changed its working directory falls back to
+   * the deepest registered directory containing it, and an unregistered
+   * directory keeps its settings under `cwd:`+path.
+   */
+  const resolveWorkspace = (sessionId) => {
+    const registry = ctx.get('workspaceRegistry')
+    const sessions = ctx.get('sessions')
+    const cwd = sessionId === undefined ? undefined : sessions?.get(sessionId)?.header?.cwd
+    if (registry !== undefined && typeof registry.list === 'function') {
+      const workspaces = registry.list()
+      if (sessionId !== undefined) {
+        const owner = workspaces.find((entry) => Array.isArray(entry.sessionIds) && entry.sessionIds.includes(sessionId))
+        if (owner !== undefined) {
+          return { key: owner.id, path: owner.path, title: owner.title, source: 'workspace' }
+        }
+      }
+      if (typeof cwd === 'string') {
+        const holder = workspaces
+          .filter((entry) => pathContains(entry.path, cwd))
+          .sort((left, right) => right.path.length - left.path.length)[0]
+        if (holder !== undefined) {
+          return { key: holder.id, path: holder.path, title: holder.title, source: 'workspace' }
+        }
+      }
+    }
+    if (typeof cwd === 'string' && cwd !== '') {
+      return { key: `cwd:${foldPath(cwd)}`, path: cwd, title: basename(cwd), source: 'directory' }
+    }
+    return { key: 'default', path: '', title: '', source: 'default' }
+  }
+
+  /**
+   * Point this call — and the live session — at the caller's workspace.
+   *
+   * A probe can only serve one target, so moving to another workspace or
+   * another board releases the session; the next `connect` attaches with the
+   * values the panel just saved.
+   */
+  const activate = async (sessionId) => {
+    const workspace = resolveWorkspace(sessionId)
+    const entry = await readWorkspace(workspace.key)
+    const target = targetFor(baseline, entry)
+    const signature = targetSignature(target)
+    const moved = active === undefined
+      || active.workspace.key !== workspace.key
+      || active.signature !== signature
+    if (moved && active !== undefined) {
+      if (session.isOpen) await session.close().catch(() => {})
+      symbols = undefined
+      symbolsSource = undefined
+      symbolsError = undefined
+    }
+    session.config = { ...resolved, ...target }
+    active = { workspace, target, signature, elfFile: entry?.elfFile }
+    return active
+  }
 
   const resolveExe = async () => {
     if (resolved.jlinkExe !== undefined) return resolved.jlinkExe
@@ -222,11 +398,12 @@ export function apply(ctx, config = {}) {
 
   const commanderConfig = async () => {
     const exe = await resolveExe()
-    return { ...resolved, jlinkExe: exe }
+    // The commander must attach to the same board the session would.
+    return { ...resolved, ...(active?.target ?? {}), jlinkExe: exe }
   }
 
   /**
-   * Load the symbol table for the image this session is working with.
+   * Load the symbol table for the image this workspace is working with.
    *
    * `required` separates the two callers: a plain register read silently loses
    * its PC annotation when no image is known, while an explicit
@@ -235,7 +412,7 @@ export function apply(ctx, config = {}) {
    * knows best which build it just made.
    */
   const loadSymbolTable = async (required) => {
-    const source = resolved.elfFile
+    const source = active?.elfFile
     if (!source) {
       if (required) {
         throw new Error(
@@ -245,16 +422,22 @@ export function apply(ctx, config = {}) {
       }
       return undefined
     }
+    if (symbols !== undefined && symbolsSource === source) return symbols
     try {
       symbols = await loadSymbols(source)
+      symbolsSource = source
       symbolsError = undefined
     } catch (error) {
       symbols = undefined
+      symbolsSource = undefined
       symbolsError = `${source}: ${error.message}`
       if (required) throw new Error(`cannot read symbols from ${symbolsError}`)
     }
     return symbols
   }
+
+  /** A symbol table only annotates the image the current workspace points at. */
+  const liveSymbols = () => (symbolsSource === active?.elfFile ? symbols : undefined)
 
   /** ARM Thumb keeps bit 0 set in st_value; the probe wants the even address. */
   const evenAddress = (value) => value & ~1
@@ -280,10 +463,11 @@ export function apply(ctx, config = {}) {
 
   /** Name the function containing this PC, when a symbol table is loaded. */
   const annotatePc = (registers) => {
-    if (symbols === undefined || registers === undefined) return undefined
+    const table = liveSymbols()
+    if (table === undefined || registers === undefined) return undefined
     const pc = Number.parseInt(String(registers.PC ?? ''), 16)
     if (!Number.isFinite(pc)) return undefined
-    const near = nearestSymbol(symbols, pc)
+    const near = nearestSymbol(table, pc)
     if (near === undefined) return undefined
     return { name: near.symbol.name, offset: near.offset }
   }
@@ -297,12 +481,15 @@ export function apply(ctx, config = {}) {
   })
 
   /** What symbol lookups currently answer from; shown by `status`. */
-  const elfSummary = () => present({
-    file: resolved.elfFile ?? '',
-    symbols: symbols === undefined ? 0 : symbols.symbols.length,
-    functions: symbols === undefined ? 0 : symbols.funcs.length,
-    error: symbolsError,
-  })
+  const elfSummary = () => {
+    const table = liveSymbols()
+    return present({
+      file: active?.elfFile ?? '',
+      symbols: table === undefined ? 0 : table.symbols.length,
+      functions: table === undefined ? 0 : table.funcs.length,
+      error: symbolsError,
+    })
+  }
 
   function stopName(stop) {
     if (stop === undefined || stop === null) return 'unknown'
@@ -313,13 +500,27 @@ export function apply(ctx, config = {}) {
   }
 
   async function runDebugAction(action, args) {
-    // Any call may point at a build with `file`. The session keeps it, so the
+    // Any call may point at a build with `file`. The workspace keeps it, so the
     // agent decides which image the symbols come from and states it once.
-    if (typeof args?.file === 'string' && args.file.trim() !== '') resolved.elfFile = args.file.trim()
+    if (typeof args?.file === 'string' && args.file.trim() !== '' && active !== undefined) {
+      const file = args.file.trim()
+      const entry = await readWorkspace(active.workspace.key) ?? {}
+      active.elfFile = file
+      await writeWorkspace(active.workspace.key, {
+        ...entry,
+        path: active.workspace.path,
+        title: active.workspace.title,
+        elfFile: file,
+      })
+    }
+    const origin = present({
+      workspace: active?.workspace,
+      config: active?.target,
+    })
     if (action === 'status') {
       // `status` is the cheap poll, so it is also the right place to warm the
       // symbol cache: a failed load stays reported instead of breaking status.
-      if (resolved.elfFile !== undefined && symbols === undefined) await loadSymbolTable(false)
+      if (active?.elfFile !== undefined && liveSymbols() === undefined) await loadSymbolTable(false)
       const elf = elfSummary()
       if (session.isOpen) {
         const info = session.describe()
@@ -332,6 +533,7 @@ export function apply(ctx, config = {}) {
           breakpoints: info.breakpoints,
           lastStop: session.lastStop,
           elf,
+          ...origin,
           summary: `${info.probe?.core ?? 'target'} · ${info.state}`,
         }
       }
@@ -344,6 +546,7 @@ export function apply(ctx, config = {}) {
         probe: result.probe,
         state: result.target?.halted === true ? 'halted' : 'running',
         elf,
+        ...origin,
         summary: result.summary,
       }
     }
@@ -615,6 +818,8 @@ export function apply(ctx, config = {}) {
       if (!ACTIONS.includes(action)) throw new Error(`unknown action: ${action}`)
       if (exec.signal?.aborted) throw new Error('cancelled before dispatch')
       await resolveExe()
+      // This call belongs to a workspace, and that workspace owns the target.
+      await activate(exec.agent?.id)
       try {
         return present(await runDebugAction(action, args))
       } finally {
@@ -650,6 +855,8 @@ export function apply(ctx, config = {}) {
     },
     async execute(args, exec) {
       if (exec.signal?.aborted) throw new Error('cancelled before dispatch')
+      await resolveExe()
+      await activate(exec.agent?.id)
       const config = await commanderConfig()
       const wasOpen = session.isOpen
       if (wasOpen) await session.close()
@@ -658,9 +865,16 @@ export function apply(ctx, config = {}) {
         const result = await perform(config, 'flash', { file: args?.file }, { halted: undefined })
         if (result.ok !== true) throw new Error(result.error ?? 'flash failed')
         // The image just programmed is the one the core runs, so it becomes the
-        // session's symbol source — no separate setting to keep in sync.
+        // workspace's symbol source — no separate setting to keep in sync.
         if (typeof result.file === 'string' && result.file.toLowerCase().endsWith('.elf')) {
-          resolved.elfFile = result.file
+          const entry = await readWorkspace(active.workspace.key) ?? {}
+          active.elfFile = result.file
+          await writeWorkspace(active.workspace.key, {
+            ...entry,
+            path: active.workspace.path,
+            title: active.workspace.title,
+            elfFile: result.file,
+          })
           await loadSymbolTable(false)
         }
         return present({
@@ -670,6 +884,8 @@ export function apply(ctx, config = {}) {
           log: result.log,
           probe: result.probe,
           sessionRestarted: wasOpen,
+          workspace: active.workspace,
+          config: active.target,
           elf: elfSummary(),
           summary: result.summary,
         })
@@ -694,15 +910,19 @@ export function apply(ctx, config = {}) {
   // showed no editable form, so the plugin ships its own page instead of
   // depending on where a particular Harness build renders one.
 
-  /** Field order and control kind for the panel; all labels live in the client. */
+  /** Field order and control kind for the global panel; all labels live in the client. */
   const PANEL_FIELDS = [
-    { key: 'device', kind: 'text' },
-    { key: 'interface', kind: 'select', options: ['SWD', 'JTAG'] },
-    { key: 'speedKhz', kind: 'number', min: 100, max: 50000 },
     { key: 'idleCloseMs', kind: 'number', min: 0, max: 86400000 },
     { key: 'maxReadBytes', kind: 'number', min: 16, max: 65536 },
     { key: 'jlinkExe', kind: 'text' },
     { key: 'gdbServerExe', kind: 'text' },
+  ]
+
+  /** Field order and control kind for the right-sidebar target panel. */
+  const TARGET_PANEL_FIELDS = [
+    { key: 'device', kind: 'text' },
+    { key: 'interface', kind: 'select', options: ['SWD', 'JTAG'] },
+    { key: 'speedKhz', kind: 'number', min: 100, max: 50000 },
   ]
 
   const panelState = () => present({
@@ -719,8 +939,117 @@ export function apply(ctx, config = {}) {
   })
 
   /**
+   * The right-sidebar panel's state: which workspace the calling session
+   * belongs to, its effective target, and whether each value overrides the
+   * global default.
+   */
+  const workspacePanelState = async (sessionId) => {
+    const workspace = resolveWorkspace(sessionId)
+    const entry = await readWorkspace(workspace.key)
+    const target = targetFor(baseline, entry)
+    const table = active !== undefined && active.workspace.key === workspace.key ? liveSymbols() : undefined
+    return present({
+      ok: true,
+      workspace,
+      fields: TARGET_PANEL_FIELDS.map((field) => present({
+        key: field.key,
+        kind: field.kind,
+        options: field.options,
+        min: field.min,
+        max: field.max,
+        value: target[field.key],
+        default: baseline[field.key],
+        override: entry?.[field.key] !== undefined,
+      })),
+      session: session.isOpen
+        ? present({
+            open: true,
+            state: session.state,
+            probe: session.describe().probe,
+            connectsTo: session.config.device,
+          })
+        : { open: false },
+      elf: present({
+        file: entry?.elfFile ?? '',
+        symbols: table === undefined ? 0 : table.symbols.length,
+        functions: table === undefined ? 0 : table.funcs.length,
+      }),
+    })
+  }
+
+  const handleWorkspaceRoute = async (req, res) => {
+    try {
+      if (req.method === 'GET') {
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        sendJson(res, 200, await workspacePanelState(url.searchParams.get('session') ?? undefined))
+        return
+      }
+      if (req.method === 'POST') {
+        const body = await readJsonBody(req)
+        const sessionId = typeof body?.session === 'string' && body.session.trim() !== ''
+          ? body.session.trim()
+          : undefined
+        const workspace = resolveWorkspace(sessionId)
+        const current = await readWorkspace(workspace.key) ?? {}
+        const next = { ...current, path: workspace.path, title: workspace.title }
+        if (body?.reset === true) {
+          for (const field of TARGET_FIELDS) delete next[field]
+        } else {
+          const patch = body?.patch ?? {}
+          const candidate = targetFor(baseline, current)
+          for (const field of TARGET_FIELDS) {
+            if (!Object.prototype.hasOwnProperty.call(patch, field)) continue
+            candidate[field] = field === 'speedKhz' ? Number(patch[field]) : patch[field]
+          }
+          if (typeof candidate.device !== 'string' || candidate.device.trim() === '') {
+            throw new Error('device must be a J-Link device name such as STM32H503CB')
+          }
+          candidate.device = candidate.device.trim()
+          // The same schema the Loader validates with, so the panel can never
+          // save a value the plugin would refuse to activate.
+          const validated = Config({ ...baseline, ...candidate })
+          const defaults = targetFor(baseline, undefined)
+          for (const field of TARGET_FIELDS) {
+            // Store only a real difference from the default, so an unchanged
+            // value keeps following a later change to the global default.
+            if (validated[field] === defaults[field]) delete next[field]
+            else next[field] = validated[field]
+          }
+        }
+        // Drop the record entirely once it carries nothing: an empty entry
+        // would otherwise outlive the overrides it used to hold.
+        const keep = TARGET_FIELDS.some((field) => next[field] !== undefined) || next.elfFile !== undefined
+        await writeWorkspace(workspace.key, keep ? next : undefined)
+        const target = targetFor(baseline, next)
+        const signature = targetSignature(target)
+        if (session.isOpen && active?.workspace.key === workspace.key && active.signature !== signature) {
+          // Saving a different board releases the probe; the next call attaches.
+          await session.close().catch(() => {})
+          symbols = undefined
+          symbolsSource = undefined
+          symbolsError = undefined
+        }
+        if (active?.workspace.key === workspace.key) {
+          active = { ...active, target, signature, elfFile: next.elfFile }
+          session.config = { ...resolved, ...target }
+        }
+        sendJson(res, 200, await workspacePanelState(sessionId))
+        return
+      }
+      res.writeHead(405, { allow: 'GET, POST' })
+      res.end()
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: String(error?.message ?? error) })
+    }
+  }
+
+  /**
    * Validate a partial patch through the same schema the Loader validates with,
    * so the panel can never write a value the plugin would refuse to activate.
+   *
+   * The Loader replaces the whole row config, so the result must stay complete:
+   * it starts from what the row already configured and keeps the target
+   * defaults this page no longer edits.
    */
   const validatedPatch = (patch) => {
     const merged = { ...baseline }
@@ -729,10 +1058,11 @@ export function apply(ctx, config = {}) {
       merged[field.key] = field.kind === 'number' ? Number(patch[field.key]) : patch[field.key]
     }
     const next = Config(merged)
-    const out = {}
+    const out = { ...given }
     for (const field of PANEL_FIELDS) {
       out[field.key] = field.kind === 'number' ? Number(next[field.key]) : String(next[field.key] ?? '')
     }
+    for (const field of TARGET_FIELDS) out[field] = next[field]
     return out
   }
 
@@ -812,15 +1142,30 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** Publish the panel's data channel when this composition serves the Web UI. */
-  const webServer = ctx.get('webServer')
-  if (webServer !== undefined && typeof webServer.register === 'function') {
-    ctx.effect(() => webServer.register({
+  // Publish the panels' data channels when this composition serves the Web UI.
+  //
+  // The Web host mounts after this plugin on a cold start, so the service is
+  // awaited through `ctx.inject` rather than read once: a one-shot `ctx.get`
+  // finds it absent, silently registers nothing, and both panels then answer
+  // HTTP 404 until the plugin happens to be reloaded.
+  ctx.inject(['webServer'], (scoped) => {
+    const webServer = scoped.get('webServer')
+    if (webServer === undefined || typeof webServer.register !== 'function') return
+    const disposeConfig = webServer.register({
       kind: 'exact',
       path: CONFIG_PATH,
       handler: handleConfigRoute,
-    }), 'jlink-debug-config-route')
-  }
+    })
+    const disposeWorkspace = webServer.register({
+      kind: 'exact',
+      path: WORKSPACE_PATH,
+      handler: handleWorkspaceRoute,
+    })
+    return () => {
+      disposeWorkspace()
+      disposeConfig()
+    }
+  })
 
   ctx.effect(() => () => {
     if (idleTimer !== undefined) clearTimeout(idleTimer)
