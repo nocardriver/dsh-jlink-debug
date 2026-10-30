@@ -25,6 +25,10 @@ window.__ModuleLoader__.load({
       'symbols.title': 'Symbols',
       'type.title': 'Type layout',
       'resolve.title': 'Resolve',
+      'watch.title': 'Watch',
+      'capture.title': 'Capture',
+      'watch_read.title': 'Watch',
+      'watch_stop.title': 'Watch',
       'field.core': 'Core',
       'field.device': 'Device',
       'field.serial': 'Probe',
@@ -103,6 +107,34 @@ window.__ModuleLoader__.load({
       'picker.failed': 'Device list unavailable',
       'picker.unknown': 'Not in the J-Link library: connecting fails unless a custom device is installed.',
       'picker.alias': 'alias of {0}',
+      'watch.section': 'Live watch',
+      'watch.intro': 'Sampling runs in the probe through background memory access: the core keeps executing. Paths such as motor[0].electric_angle resolve through DWARF.',
+      'watch.empty': 'No watch points. Add a symbol or a member path to start.',
+      'watch.placeholder': 'motor[0].electric_angle',
+      'watch.add': 'Add',
+      'watch.remove': 'Remove {0}',
+      'watch.start': 'Start sampling',
+      'watch.stop': 'Stop',
+      'watch.clear': 'Clear trace',
+      'watch.period': 'Period',
+      'watch.periodUnit': 'ms',
+      'watch.sampling': 'sampling',
+      'watch.stopped': 'stopped',
+      'watch.collected': '{0} samples',
+      'watch.points': 'points',
+      'watch.halted': 'The core is halted, so samples will not change.',
+      'watch.noSession': 'The probe is released. Start sampling to attach.',
+      'watch.resume': 'Resume core',
+      'watch.halt': 'Halt core',
+      'watch.last': 'last',
+      'watch.min': 'min',
+      'watch.max': 'max',
+      'watch.value': 'value',
+      'watch.failed': 'Watch request failed.',
+      'watch.skipped': 'Not watched: {0}',
+      'watch.error': 'Sampling error: {0}',
+      'watch.constant': 'constant',
+      'watch.chart': 'Trace',
     }
 
     const ZH = {
@@ -193,6 +225,34 @@ window.__ModuleLoader__.load({
       'picker.failed': '器件库不可用',
       'picker.unknown': 'J-Link 器件库里没有这个型号：除非装了自定义器件，否则连接会失败。',
       'picker.alias': '别名：{0}',
+      'watch.section': '实时观测',
+      'watch.intro': '采样在探针里通过后台内存访问完成，内核照常运行。motor[0].electric_angle 这类路径按 DWARF 解析。',
+      'watch.empty': '还没有观测点。加一个符号或成员路径就能开始。',
+      'watch.placeholder': 'motor[0].electric_angle',
+      'watch.add': '添加',
+      'watch.remove': '移除 {0}',
+      'watch.start': '开始采样',
+      'watch.stop': '停止',
+      'watch.clear': '清空轨迹',
+      'watch.period': '周期',
+      'watch.periodUnit': 'ms',
+      'watch.sampling': '采样中',
+      'watch.stopped': '已停止',
+      'watch.collected': '{0} 个样本',
+      'watch.points': '个观测点',
+      'watch.halted': '内核已停止，样本不会变化。',
+      'watch.noSession': '探针已释放，开始采样时会自动连接。',
+      'watch.resume': '运行内核',
+      'watch.halt': '暂停内核',
+      'watch.last': '当前',
+      'watch.min': '最小',
+      'watch.max': '最大',
+      'watch.value': '值',
+      'watch.failed': '观测请求失败。',
+      'watch.skipped': '未观测：{0}',
+      'watch.error': '采样错误：{0}',
+      'watch.constant': '恒定',
+      'watch.chart': '轨迹',
     }
 
     /** `{0}`-style substitution for the few labels that carry a count or name. */
@@ -418,6 +478,95 @@ window.__ModuleLoader__.load({
       return h('div', { key: 'type', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, children)
     }
 
+    // ----------------------------------------------------------------- watch
+    //
+    // A watch result carries the newest samples of every point, so the card can
+    // draw the same trace the sidebar shows. The chart is one SVG polyline over
+    // a 0..100 viewBox: no measuring, no canvas, and it scales with the card.
+
+    function formatWatchValue(value) {
+      if (value === undefined || value === null) return '—'
+      if (typeof value === 'number') {
+        if (!Number.isFinite(value)) return String(value)
+        return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(4)))
+      }
+      if (typeof value === 'boolean') return value ? 'true' : 'false'
+      if (typeof value === 'string') return value.length > 48 ? value.slice(0, 48) + '…' : value
+      try {
+        const text = JSON.stringify(value)
+        return text.length > 60 ? text.slice(0, 60) + '…' : text
+      } catch {
+        return String(value)
+      }
+    }
+
+    /** A trace as an inline SVG. Flat series are drawn as a grey line. */
+    function sparkline(samples, height = 26) {
+      const values = Array.isArray(samples)
+        ? samples.filter((value) => typeof value === 'number' && Number.isFinite(value))
+        : []
+      if (values.length < 2) {
+        return h('div', { style: { ...S.summary, fontFamily: MONO, fontSize: 11 } }, '—')
+      }
+      const min = Math.min(...values)
+      const max = Math.max(...values)
+      const span = max - min || 1
+      const step = 100 / (values.length - 1)
+      const points = values.map((value, index) => {
+        const x = index * step
+        const y = height - 2 - ((value - min) / span) * (height - 4)
+        return x.toFixed(2) + ',' + y.toFixed(2)
+      }).join(' ')
+      return h('svg', {
+        viewBox: '0 0 100 ' + height,
+        preserveAspectRatio: 'none',
+        style: { display: 'block', width: '100%', height, overflow: 'visible' },
+      }, h('polyline', {
+        points,
+        fill: 'none',
+        stroke: max === min ? 'var(--dsw-alias-label-secondary)' : 'var(--dsw-alias-brand-primary)',
+        strokeWidth: 1,
+        vectorEffect: 'non-scaling-stroke',
+      }))
+    }
+
+    /**
+     * Watch rows: name, current value, range and a sparkline. A start result has
+     * no samples yet, so it lists the resolved addresses instead.
+     */
+    function watchTable(t, data) {
+      if (!Array.isArray(data?.items) || data.items.length === 0) return null
+      const withValues = data.items.some((item) => item?.last !== undefined || Array.isArray(item?.samples))
+      if (withValues !== true) {
+        return h('div', { style: { ...S.hexdump, display: 'flex', flexDirection: 'column', gap: 2 } },
+          data.items.map((item, index) => h('div', { key: index, style: S.row },
+            h('span', { style: { ...S.mono, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } }, String(item?.name ?? '')),
+            h('span', { style: { ...S.mono, color: 'var(--dsw-alias-label-secondary)' } }, String(item?.address ?? '')),
+            h('span', { style: { ...S.mono, color: 'var(--dsw-alias-label-secondary)' } }, String(item?.type ?? '')))))
+      }
+      const head = h('div', { key: 'head', style: { ...S.row, fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+        h('span', { style: { ...S.mono, flex: '1 1 42%', minWidth: 0 } }, t('field.name')),
+        h('span', { style: { ...S.mono, flex: '0 0 auto' } }, t('watch.last')),
+        h('span', { style: { ...S.mono, flex: '0 0 auto' } }, t('watch.min')),
+        h('span', { style: { ...S.mono, flex: '0 0 auto' } }, t('watch.max')))
+      const rows = data.items.map((item, index) => h('div', {
+        key: index,
+        style: { display: 'flex', flexDirection: 'column', gap: 2 },
+      },
+        h('div', { style: S.row },
+          h('span', {
+            style: { ...S.mono, flex: '1 1 42%', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' },
+            title: String(item?.name ?? ''),
+          }, String(item?.name ?? '')),
+          h('span', { style: { ...S.mono, flex: '0 0 auto' } }, formatWatchValue(item?.last)),
+          h('span', { style: { ...S.mono, flex: '0 0 auto', color: 'var(--dsw-alias-label-secondary)' } },
+            item?.min === undefined ? '—' : formatWatchValue(item.min)),
+          h('span', { style: { ...S.mono, flex: '0 0 auto', color: 'var(--dsw-alias-label-secondary)' } },
+            item?.max === undefined ? '—' : formatWatchValue(item.max))),
+        Array.isArray(item?.samples) && item.samples.length > 1 ? sparkline(item.samples) : null))
+      return h('div', { style: { ...S.hexdump, display: 'flex', flexDirection: 'column', gap: 6 } }, [head, ...rows])
+    }
+
     /** Render the decoded value of a symbol read, with its DWARF type name. */
     function decodedValue(t, data) {
       if (data === null || typeof data !== 'object' || data.value === undefined) return null
@@ -592,6 +741,18 @@ window.__ModuleLoader__.load({
 
       const layout = typeLayout(t, data)
       if (layout !== null) children.push(h('div', { key: 'type-wrap' }, layout))
+
+      const watch = watchTable(t, data)
+      if (watch !== null) {
+        children.push(h('div', { key: 'watch-wrap' }, watch))
+        if (data.running === false && typeof data.stopReason === 'string' && data.stopReason !== '') {
+          children.push(h('div', { key: 'watch-stop', style: S.summary }, data.stopReason))
+        }
+        if (Array.isArray(data.skipped) && data.skipped.length > 0) {
+          children.push(h('div', { key: 'watch-skipped', style: S.note },
+            fill(t('watch.skipped'), data.skipped.map((entry) => String(entry?.name ?? '') + ': ' + String(entry?.reason ?? '')).join('; '))))
+        }
+      }
 
       const log = logLines(data.log)
       if (log !== null) children.push(h('div', { key: 'log' }, log))
@@ -1447,6 +1608,268 @@ window.__ModuleLoader__.load({
         status)
     }
 
+    // ------------------------------------------------------------- watch panel
+    //
+    // The live chart belongs next to the target form: the tab is already scoped
+    // to one workspace's board, and the trace describes that board. The panel
+    // polls the Host route; sampling itself runs in the plugin, so closing the
+    // tab or reloading the page does not stop it.
+
+    const W = {
+      section: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' },
+      sectionTitle: { fontSize: 13, fontWeight: 600 },
+      intro: { fontSize: 11.5, lineHeight: '16px', color: 'var(--dsw-alias-label-secondary)' },
+      row: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
+      chips: { display: 'flex', flexWrap: 'wrap', gap: 4 },
+      chip: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 2,
+        maxWidth: '100%',
+        padding: '1px 2px 1px 7px',
+        borderRadius: 6,
+        border: '1px solid var(--dsw-alias-border-l1)',
+        background: 'var(--dsw-alias-bg-layer-2)',
+        fontFamily: MONO,
+        fontSize: 11.5,
+      },
+      chipText: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+      chipButton: {
+        border: 'none',
+        background: 'transparent',
+        color: 'var(--dsw-alias-label-secondary)',
+        cursor: 'pointer',
+        fontSize: 13,
+        lineHeight: '16px',
+        padding: '0 4px',
+      },
+      point: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 2,
+        padding: '7px 0 5px',
+        borderTop: '1px solid var(--dsw-alias-border-l1)',
+      },
+      pointHead: { display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 },
+      pointName: {
+        fontFamily: MONO,
+        fontSize: 11.5,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+        flex: '1 1 auto',
+      },
+      pointValue: { fontFamily: MONO, fontSize: 12, flex: '0 0 auto' },
+      pointRange: { fontFamily: MONO, fontSize: 10.5, color: 'var(--dsw-alias-label-secondary)' },
+      select: { ...R.input, width: 'auto', padding: '0 4px' },
+    }
+
+    function watchEndpoint(sessionId, limit) {
+      const base = hostEndpoint('jlink-debug/watch')
+      const params = new URLSearchParams()
+      if (sessionId !== '') params.set('session', sessionId)
+      if (limit !== undefined) params.set('limit', String(limit))
+      const query = params.toString()
+      return query === '' ? base : base + '?' + query
+    }
+
+    const PERIODS = [10, 20, 50, 100, 200, 500]
+
+    /**
+     * Live watch: the point list, the run controls and one sparkline per point.
+     * The Host owns the sampling; this component only writes the point list and
+     * polls the trace, so a page reload never interrupts a capture.
+     */
+    function WatchPanel(props) {
+      const t = props.t
+      const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
+      const [state, setState] = React.useState(undefined)
+      const [symbols, setSymbols] = React.useState([])
+      const [draft, setDraft] = React.useState('')
+      const [periodMs, setPeriodMs] = React.useState(50)
+      const [busy, setBusy] = React.useState(false)
+      const [error, setError] = React.useState(undefined)
+      const alive = React.useRef(true)
+      const pending = React.useRef(false)
+      const periodAdopted = React.useRef(false)
+
+      React.useEffect(() => {
+        alive.current = true
+        return () => { alive.current = false }
+      }, [])
+
+      const adopt = React.useCallback((data) => {
+        setState(data)
+        if (pending.current !== true && Array.isArray(data?.points)) {
+          const next = data.points.join('\n')
+          setSymbols((current) => (current.join('\n') === next ? current : data.points.slice()))
+        }
+        // The period is a control, not a readout: take the Host's value once so
+        // the panel starts in sync, then leave the user's choice alone. Polling
+        // must not snap a freshly picked period back to the running one.
+        if (periodAdopted.current !== true) {
+          periodAdopted.current = true
+          if (typeof data?.periodMs === 'number' && data.periodMs > 0) setPeriodMs(data.periodMs)
+        }
+      }, [])
+
+      const load = React.useCallback(async () => {
+        if (sessionId === '') return
+        try {
+          const response = await fetch(watchEndpoint(sessionId, 120), { cache: 'no-store' })
+          const data = await response.json().catch(() => ({}))
+          if (alive.current !== true) return
+          if (response.ok !== true || data.ok !== true) throw new Error(data.error ?? ('HTTP ' + String(response.status)))
+          adopt(data)
+          setError(undefined)
+        } catch (failure) {
+          if (alive.current === true) setError(String(failure?.message ?? failure))
+        }
+      }, [adopt, sessionId])
+
+      React.useEffect(() => {
+        void load()
+        const timer = setInterval(() => { void load() }, 400)
+        return () => clearInterval(timer)
+      }, [load])
+
+      const post = async (body) => {
+        setBusy(true)
+        pending.current = true
+        setError(undefined)
+        try {
+          const response = await fetch(watchEndpoint(sessionId), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ session: sessionId, limit: 120, ...body }),
+          })
+          const data = await response.json().catch(() => ({}))
+          if (response.ok !== true || data.ok !== true) throw new Error(data.error ?? ('HTTP ' + String(response.status)))
+          if (alive.current === true) adopt(data)
+        } catch (failure) {
+          if (alive.current === true) setError(String(failure?.message ?? failure))
+        } finally {
+          pending.current = false
+          if (alive.current === true) setBusy(false)
+        }
+      }
+
+      const running = state?.running === true
+      const configured = state?.configured === true
+      const coreState = state?.state
+
+      const add = () => {
+        const name = draft.trim()
+        if (name === '') return
+        setDraft('')
+        const next = symbols.includes(name) ? symbols : [...symbols, name]
+        setSymbols(next)
+        if (running) void post({ action: 'start', symbols: next, periodMs, resume: true })
+      }
+
+      const remove = (name) => {
+        const next = symbols.filter((entry) => entry !== name)
+        setSymbols(next)
+        if (next.length === 0) {
+          if (configured) void post({ action: 'stop' })
+          return
+        }
+        if (running) void post({ action: 'start', symbols: next, periodMs, resume: true })
+      }
+
+      const start = () => {
+        if (symbols.length > 0) void post({ action: 'start', symbols, periodMs, resume: true })
+      }
+
+      const items = Array.isArray(state?.items) ? state.items : []
+      const children = [
+        h('div', { key: 'head', style: W.section },
+          h('span', { key: 'title', style: W.sectionTitle }, t('watch.section')),
+          h('span', { key: 'pill', style: R.tag }, running ? t('watch.sampling') : t('watch.stopped')),
+          configured
+            ? h('span', { key: 'count', style: R.tag }, fill(t('watch.collected'), state.collected ?? 0))
+            : null),
+        h('div', { key: 'intro', style: W.intro }, t('watch.intro')),
+      ]
+
+      if (symbols.length === 0) {
+        children.push(h('div', { key: 'empty', style: W.intro }, t('watch.empty')))
+      } else {
+        children.push(h('div', { key: 'chips', style: W.chips }, symbols.map((name) =>
+          h('span', { key: name, style: W.chip, title: name },
+            h('span', { style: W.chipText }, name),
+            h('button', {
+              type: 'button',
+              style: W.chipButton,
+              title: fill(t('watch.remove'), name),
+              onClick: () => remove(name),
+            }, '×')))))
+      }
+
+      children.push(h('div', { key: 'entry', style: W.row },
+        h('input', {
+          value: draft,
+          placeholder: t('watch.placeholder'),
+          spellCheck: false,
+          style: R.input,
+          onChange: (event) => { setDraft(event.target.value); setError(undefined) },
+          onKeyDown: (event) => {
+            if (event.key === 'Enter') { event.preventDefault(); add() }
+          },
+          disabled: busy,
+        }),
+        h('button', { type: 'button', style: R.button, disabled: busy || draft.trim() === '', onClick: add }, t('watch.add'))))
+
+      children.push(h('div', { key: 'controls', style: R.actions },
+        h('select', {
+          value: String(periodMs),
+          style: W.select,
+          disabled: busy,
+          title: t('watch.period'),
+          onChange: (event) => setPeriodMs(Number(event.target.value)),
+        }, PERIODS.map((value) => h('option', { key: value, value: String(value) }, String(value) + ' ' + t('watch.periodUnit')))),
+        running
+          ? h('button', { key: 'stop', type: 'button', style: R.button, disabled: busy, onClick: () => { void post({ action: 'stop' }) } }, t('watch.stop'))
+          : h('button', {
+              key: 'start',
+              type: 'button',
+              style: { ...R.primary, opacity: busy || symbols.length === 0 ? 0.6 : 1 },
+              disabled: busy || symbols.length === 0,
+              onClick: start,
+            }, t('watch.start')),
+        configured
+          ? h('button', { key: 'clear', type: 'button', style: R.button, disabled: busy, onClick: () => { void post({ action: 'clear' }) } }, t('watch.clear'))
+          : null,
+        sessionId === '' ? null : (coreState === 'halted'
+          ? h('button', { key: 'resume', type: 'button', style: R.button, disabled: busy, onClick: () => { void post({ action: 'resume' }) } }, t('watch.resume'))
+          : (coreState === 'running'
+            ? h('button', { key: 'halt', type: 'button', style: R.button, disabled: busy, onClick: () => { void post({ action: 'halt' }) } }, t('watch.halt'))
+            : null))))
+
+      if (items.length > 0) {
+        children.push(h('div', { key: 'chart', style: { ...R.card, padding: '4px 10px 8px', gap: 0 } },
+          items.map((item, index) => h('div', { key: String(item?.name ?? index), style: W.point },
+            h('div', { style: W.pointHead },
+              h('span', { style: W.pointName, title: String(item?.name ?? '') }, String(item?.name ?? '')),
+              h('span', { style: W.pointValue }, formatWatchValue(item?.last))),
+            item?.numeric === true ? sparkline(item?.samples, 30) : null,
+            h('div', { style: W.pointRange },
+              (item?.min === undefined ? '—' : t('watch.min') + ' ' + formatWatchValue(item.min))
+              + ' · ' + (item?.max === undefined ? '—' : t('watch.max') + ' ' + formatWatchValue(item.max))
+              + (item?.distinct === 1 ? ' · ' + t('watch.constant') : ''))))))
+      }
+
+      if (configured && coreState === 'halted') {
+        children.push(h('div', { key: 'halted', style: R.note }, t('watch.halted')))
+      }
+      if (typeof state?.error === 'string' && state.error !== '') {
+        children.push(h('div', { key: 'werr', style: R.bad }, fill(t('watch.error'), state.error)))
+      }
+      if (error !== undefined) children.push(h('div', { key: 'err', style: R.bad }, t('watch.failed') + ' ' + error))
+
+      return h('div', { key: 'watch-panel', style: { display: 'flex', flexDirection: 'column', gap: 10 } }, children)
+    }
+
     /**
      * The workspace's target form. It follows the session that owns the tab:
      * the Host resolves that session to a workspace and answers with the
@@ -1639,6 +2062,10 @@ window.__ModuleLoader__.load({
                 String(elf.file).split(/[\\/]/).pop())
             : null))
       }
+
+      // Live watch: it shares the tab with the target because both describe the
+      // same board, and a watch needs the symbols this workspace already set.
+      children.push(h(WatchPanel, { key: 'watch', sessionId, t }))
 
       return h('div', { style: R.page }, children)
     }

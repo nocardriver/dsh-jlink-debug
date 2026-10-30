@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "J-Link MCU Debug",
-    "description": "Debug, inspect and flash a microcontroller over SEGGER J-Link: pick the chip by searching the installed J-Link device library (recent choices one click away), set transport and clock per workspace in a right-sidebar panel, then read registers and memory, inspect struct fields through DWARF types, set breakpoints by name from the firmware symbol table, single-step and download firmware, with cards rendered in the conversation."
+    "description": "Debug, inspect and flash a microcontroller over SEGGER J-Link: pick the chip by searching the installed J-Link device library (recent choices one click away), set transport and clock per workspace in a right-sidebar panel, then read registers and memory, inspect struct fields through DWARF types, set breakpoints by name from the firmware symbol table, single-step and download firmware, and watch variables continuously with background sampling that never halts the core — plotted live in the sidebar and rendered as cards in the conversation."
   }
 }

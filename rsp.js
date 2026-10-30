@@ -10,6 +10,11 @@ import net from 'node:net'
 
 const ACK = '+'
 const NAK = '-'
+/** Set DSH_JLINK_RSP_TRACE=1 to log every packet on the console. */
+const TRACE = process.env.DSH_JLINK_RSP_TRACE === '1'
+const trace = (arrow, text) => {
+  if (TRACE) console.log(`rsp ${arrow} ${JSON.stringify(String(text).slice(0, 160))}`)
+}
 
 function checksum(text) {
   let sum = 0
@@ -62,7 +67,17 @@ export class RspConnection {
     }
   }
 
+  /**
+   * Hand one incoming packet to the oldest request that is waiting for it.
+   *
+   * This plugin never leaves a packet outstanding: run control is `monitor go`
+   * and `monitor halt`, both of which answer immediately, and background reads
+   * are monitor packets too. So every reply belongs to a request in order; a
+   * packet nobody waits for is an unsolicited stop notification and is kept as
+   * an event rather than being mistaken for a reply.
+   */
   #dispatch(body) {
+    trace('<<', body)
     const entry = this.pending.shift()
     if (entry !== undefined) {
       if (entry.timer !== undefined) clearTimeout(entry.timer)
@@ -81,8 +96,7 @@ export class RspConnection {
 
   /**
    * Send one packet and resolve with its reply.
-   * `timeoutMs <= 0` means no timeout, which `c` needs: it only answers when
-   * the target stops.
+   * `timeoutMs <= 0` means no timeout, for a packet that only answers later.
    */
   request(body, timeoutMs = 5000) {
     if (this.closed) return Promise.reject(new Error('RSP connection closed'))
@@ -96,13 +110,9 @@ export class RspConnection {
         : undefined
       const entry = { resolve, reject, timer }
       this.pending.push(entry)
+      trace('>>', body)
       this.socket.write(`$${body}#${checksum(body)}`)
     })
-  }
-
-  /** Interrupt a running target (raw 0x03, not a packet). */
-  interrupt() {
-    this.socket.write(Buffer.from([0x03]))
   }
 
   onEvent(listener) {
@@ -166,7 +176,9 @@ export function decodeHexBytes(hex) {
 
 /** Encode bytes as the hex payload an `M` packet expects. */
 export function encodeHexBytes(bytes) {
-  return bytes.map((b) => b.toString(16).padStart(2, '0')).join('')
+  // Buffer/TypedArray.map coerces the callback result back into a byte, which
+  // would turn "6d" into 0. Array.from is what keeps the hex strings intact.
+  return Array.from(bytes, (b) => (b & 0xff).toString(16).padStart(2, '0')).join('')
 }
 
 /** Encode a monitor command for `qRcmd`. */

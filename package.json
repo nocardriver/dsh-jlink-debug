@@ -1,8 +1,8 @@
 {
   "name": "@nocardriver/dsh-jlink-debug",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "SEGGER J-Link debugging, symbol-aware memory access and firmware flashing for DeepSeek Harness",
+  "description": "SEGGER J-Link debugging, background watch sampling, symbol-aware memory access and firmware flashing for DeepSeek Harness",
   "license": "MIT",
   "type": "module",
   "exports": {
@@ -17,6 +17,7 @@
     "jlink.js",
     "session.js",
     "rsp.js",
+    "watch.js",
     "elf.js",
     "dwarf.js",
     "devices.js",

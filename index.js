@@ -22,6 +22,7 @@ import { findSymbol, loadSymbols, nearestSymbol } from './elf.js'
 import { loadDebugInfo } from './dwarf.js'
 import { findJLink, perform } from './jlink.js'
 import { ProbeSession } from './session.js'
+import { Watcher } from './watch.js'
 
 export const inject = ['tools']
 
@@ -30,6 +31,7 @@ const PACKAGE_NAME = '@nocardriver/dsh-jlink-debug'
 const CONFIG_PATH = '/jlink-debug/config'
 const WORKSPACE_PATH = '/jlink-debug/workspace'
 const DEVICES_PATH = '/jlink-debug/devices'
+const WATCH_PATH = '/jlink-debug/watch'
 
 /**
  * The fields that describe the attached target rather than this machine. A chip
@@ -108,12 +110,13 @@ const ACTIONS = [
   'status', 'connect', 'disconnect', 'halt', 'resume', 'step',
   'registers', 'read_memory', 'write_memory', 'breakpoint', 'reset',
   'symbols', 'type', 'resolve',
+  'watch', 'watch_read', 'watch_stop', 'capture',
 ]
 
 const DESCRIPTION = [
   'Debug a microcontroller over SEGGER J-Link (SWD/JTAG) with a persistent debug session.',
   'Actions:',
-  'status — probe identity, core, run state and current breakpoints;',
+  'status — probe identity, core, run state, current breakpoints and any active watch;',
   'connect — attach the debug session; the core keeps running unless halt is set;',
   'disconnect — release the probe so Ozone/Keil or JLink.exe can use it;',
   'halt — stop the core and report why it stopped;',
@@ -126,11 +129,17 @@ const DESCRIPTION = [
   'reset — reset the core and hold it at the reset vector;',
   'symbols — list or search names from the firmware .elf symbol table (objects carry their DWARF type);',
   'type — show a DWARF type layout: fields, offsets and enum values, for a type name or a variable;',
-  'resolve — turn one symbol name into its address.',
+  'resolve — turn one symbol name into its address;',
+  'watch — start background sampling of `symbols` (names or paths such as "motor[0].electric_angle") at periodMs;',
+  'watch_read — read the newest samples plus min/max/mean for the active watch; waitMs waits for that many samples;',
+  'watch_stop — stop sampling and return the final statistics;',
+  'capture — sample `symbols` for `samples` points in one call and return the trace.',
+  'A watch samples through the probe\'s background memory access: the core keeps executing, so this is safe on a',
+  'running control loop. At most 24 watch points; nearby addresses share one read.',
   'read_memory, write_memory and breakpoint also accept `symbol` instead of `address`,',
   'and a read whose length is omitted reads the whole symbol (up to maxReadBytes).',
   'Pass `file` (the .elf you built) on any call to name symbols; mcu_flash sets it too.',
-  'Reads halt the core only for the duration of the call and restore its previous run state.',
+  'Reads on a running target use background access and do not halt the core.',
 ].join(' ')
 
 const FLASH_DESCRIPTION = [
@@ -207,6 +216,16 @@ function describeCall(args) {
   if (action === 'type') return { card: 'generic', title: `MCU type ${args?.name ?? '?'}`, kind: 'read' }
   if (action === 'resolve') return { card: 'generic', title: `MCU resolve ${args?.name ?? '?'}`, kind: 'read' }
   if (action === 'step') return { card: 'generic', title: `MCU step ${args?.count ?? 1}`, kind: 'execute' }
+  if (action === 'watch') {
+    const list = Array.isArray(args?.symbols) ? args.symbols : []
+    return { card: 'generic', title: `MCU watch ${list.length === 0 ? '' : list.join(', ')}`.trim(), kind: 'read' }
+  }
+  if (action === 'watch_read') return { card: 'generic', title: 'MCU watch read', kind: 'read' }
+  if (action === 'watch_stop') return { card: 'generic', title: 'MCU watch stop', kind: 'read' }
+  if (action === 'capture') {
+    const list = Array.isArray(args?.symbols) ? args.symbols : []
+    return { card: 'generic', title: `MCU capture ${list.length === 0 ? '' : list.join(', ')}`.trim(), kind: 'read' }
+  }
   if (action === 'registers') return { card: 'generic', title: 'MCU registers', kind: 'other' }
   if (action === 'reset') return { card: 'generic', title: 'MCU reset', kind: 'execute' }
   return { card: 'generic', title: `MCU ${action}`, kind: 'other' }
@@ -267,6 +286,12 @@ export function apply(ctx, config = {}) {
   /** The config as loaded, before runtime discovery fills anything in. */
   const baseline = { ...resolved }
   const session = new ProbeSession(resolved)
+  /**
+   * One watch set at a time. It belongs to the live session: starting a watch
+   * on another workspace or closing the probe stops it, because the addresses
+   * it holds belong to one image.
+   */
+  const watcher = new Watcher(session)
   let pendingExe
   let idleTimer
   /** Parsed .elf symbol table, and the image it was parsed from. */
@@ -379,6 +404,7 @@ export function apply(ctx, config = {}) {
       || active.workspace.key !== workspace.key
       || active.signature !== signature
     if (moved && active !== undefined) {
+      watcher.stop('workspace changed')
       if (session.isOpen) await session.close().catch(() => {})
       symbols = undefined
       symbolsSource = undefined
@@ -407,12 +433,23 @@ export function apply(ctx, config = {}) {
 
   const armIdle = () => {
     if (idleTimer !== undefined) clearTimeout(idleTimer)
+    // A watch owns the session for as long as it runs: releasing the probe
+    // would stop the trace the user is looking at.
+    if (watcher.running) return
     if (!(resolved.idleCloseMs > 0)) return
     idleTimer = setTimeout(() => {
       idleTimer = undefined
       session.close().catch(() => {})
     }, resolved.idleCloseMs)
     if (typeof idleTimer.unref === 'function') idleTimer.unref()
+  }
+
+  /** The session a watch needs: attach lazily, exactly once. */
+  const ensureSession = async (options = {}) => {
+    if (session.isOpen) return session
+    const info = await session.open({ halt: options.halt === true })
+    void recordDeviceHistory(STATE_DIR, session.config.device)
+    return { session, info }
   }
 
   const commanderConfig = async () => {
@@ -569,6 +606,128 @@ export function apply(ctx, config = {}) {
     return String(stop.kind)
   }
 
+  /** Decode an integer of 1, 2 or 4 bytes for a symbol with no DWARF type. */
+  function decodeUnsigned(bytes) {
+    if (bytes.length === 0) return undefined
+    let value = 0
+    for (let i = 0; i < bytes.length && i < 4; i += 1) value += bytes[i] * 2 ** (8 * i)
+    return value >>> 0
+  }
+
+  /**
+   * Turn watch expressions into sampleable items.
+   *
+   * `name.path[0].field` is resolved through DWARF, so only the bytes that
+   * matter are read. A plain name still works on a stripped image: it is read
+   * as an unsigned integer of the symbol's size. A path that cannot be resolved
+   * is an error, never a silent whole-struct read.
+   */
+  const watchItems = async (names) => {
+    if (!Array.isArray(names) || names.length === 0) {
+      throw new Error('watch needs `symbols`: symbol names or paths such as "motor[0].electric_angle"')
+    }
+    if (names.length > 24) throw new Error('a watch holds at most 24 symbols at once')
+    const table = await loadSymbolTable(true)
+    const debug = await loadDebugTable(false)
+    const items = []
+    const skipped = []
+    for (const raw of names) {
+      const expression = String(raw ?? '').trim()
+      if (expression === '') continue
+      const resolved = debug?.resolveExpression(expression)
+      if (resolved !== undefined) {
+        // A scalar is all a chart needs; a struct keeps its fields for the panel.
+        const depth = resolved.size > 8 ? 2 : 1
+        items.push({
+          name: expression,
+          address: resolved.address,
+          size: resolved.size,
+          type: resolved.type,
+          decode: (bytes) => (bytes.length < resolved.size
+            ? undefined
+            : debug.decode(resolved.die, bytes, { depth })),
+        })
+        continue
+      }
+      const hasPath = /[.[]/.test(expression)
+      const base = /^[A-Za-z_][A-Za-z0-9_$]*/.exec(expression)?.[0] ?? expression
+      const symbol = findSymbol(table, base)
+      if (hasPath) {
+        skipped.push({
+          name: expression,
+          reason: debug === undefined
+            ? 'no DWARF in this image, so member paths cannot be resolved'
+            : symbol === undefined
+              ? `no symbol ${base}`
+              : 'the path does not name a member, array index or whole variable',
+        })
+        continue
+      }
+      if (symbol === undefined) {
+        const candidates = table.symbols
+          .filter((entry) => entry.name.toLowerCase().includes(base.toLowerCase()))
+          .slice(0, 5)
+          .map((entry) => entry.name)
+        skipped.push({
+          name: expression,
+          reason: candidates.length === 0
+            ? 'unknown symbol'
+            : `unknown symbol; did you mean ${candidates.join(', ')}?`,
+        })
+        continue
+      }
+      // Without DWARF all that can honestly be said is "an unsigned integer of
+      // up to 32 bits"; decodeUnsigned reads at most four bytes.
+      const size = Math.min(Math.max(symbol.size > 0 ? symbol.size : 4, 1), 4)
+      items.push({
+        name: expression,
+        address: evenAddress(symbol.address),
+        size,
+        type: `uint${size * 8}`,
+        decode: decodeUnsigned,
+      })
+    }
+    if (items.length === 0) {
+      throw new Error(`no watch point could be resolved: ${skipped.map((entry) => `${entry.name} (${entry.reason})`).join('; ')}`)
+    }
+    return { items, skipped }
+  }
+
+  /** A short, JSON-safe view of the watch for `status` and tool summaries. */
+  const watchSummary = () => {
+    if (watcher.items.length === 0) return undefined
+    const status = watcher.status()
+    return present({
+      running: status.running,
+      periodMs: status.periodMs,
+      collected: status.collected,
+      state: status.state,
+      points: status.points,
+      error: status.error,
+      stopReason: status.stopReason,
+    })
+  }
+
+  /** Start a watch on the calling workspace's image; attaches if needed. */
+  const startWatch = async (args) => {
+    const { items, skipped } = await watchItems(args?.symbols)
+    await resolveExe()
+    await ensureSession()
+    if (args?.resume === true && session.state !== 'running') await session.resume()
+    const periodMs = toNumber(args?.periodMs, 'periodMs') ?? 20
+    const status = watcher.start(items, { periodMs })
+    if (idleTimer !== undefined) { clearTimeout(idleTimer); idleTimer = undefined }
+    return present({
+      ok: true,
+      action: 'watch',
+      ...status,
+      skipped: skipped.length === 0 ? undefined : skipped,
+      watch: watchSummary(),
+      summary: `watching ${items.length} point${items.length === 1 ? '' : 's'} every ${status.periodMs} ms`
+        + (session.state === 'running' ? '' : ' · target halted, values will not change'),
+    })
+  }
+
   async function runDebugAction(action, args) {
     // Any call may point at a build with `file`. The workspace keeps it, so the
     // agent decides which image the symbols come from and states it once.
@@ -594,19 +753,23 @@ export function apply(ctx, config = {}) {
       if (active?.elfFile !== undefined && liveDebug() === undefined) await loadDebugTable(false)
       const elf = elfSummary()
       if (session.isOpen) {
+        // Under monitor run control the server is not told about a breakpoint
+        // stop, so ask the core itself before reporting the state.
+        const refreshed = await session.refresh()
         const info = session.describe()
-        return {
+        return present({
           ok: true,
           action,
           session: 'open',
-          state: info.state,
+          state: refreshed.state,
           probe: info.probe,
           breakpoints: info.breakpoints,
-          lastStop: session.lastStop,
+          lastStop: refreshed.stop ?? session.lastStop,
+          watch: watchSummary(),
           elf,
           ...origin,
-          summary: `${info.probe?.core ?? 'target'} · ${info.state}`,
-        }
+          summary: `${info.probe?.core ?? 'target'} · ${refreshed.state}`,
+        })
       }
       const result = await perform(await commanderConfig(), 'status', {}, { halted: undefined })
       if (result.ok !== true) throw new Error(result.error ?? 'status failed')
@@ -629,6 +792,7 @@ export function apply(ctx, config = {}) {
     }
 
     if (action === 'disconnect') {
+      watcher.stop('probe released')
       await session.close()
       if (idleTimer !== undefined) { clearTimeout(idleTimer); idleTimer = undefined }
       return { ok: true, action, session: 'closed', summary: 'probe released' }
@@ -753,6 +917,59 @@ export function apply(ctx, config = {}) {
         type: layout,
         summary: parts.filter((part) => part !== undefined && part !== '').join(' · '),
       }
+    }
+
+    // ------------------------------------------------------------ watch
+    //
+    // These are the only actions that attach on their own: a watch is meant to
+    // start observing, and asking for `connect` first would just be ceremony.
+
+    if (action === 'watch') return startWatch(args)
+
+    if (action === 'watch_read') {
+      if (watcher.items.length === 0) throw new Error('no watch is configured; call action "watch" with `symbols` first')
+      const limit = Math.min(Math.max(toNumber(args?.samples, 'samples') ?? 60, 1), 1000)
+      const waitMs = Math.min(Math.max(toNumber(args?.waitMs, 'waitMs') ?? 0, 0), 30000)
+      const waited = waitMs > 0 && watcher.count < limit ? await watcher.waitFor(limit, waitMs) : undefined
+      const snapshot = watcher.snapshot({ limit })
+      return present({
+        ok: true,
+        action,
+        ...snapshot,
+        waited,
+        summary: `${snapshot.collected} samples every ${snapshot.periodMs} ms`
+          + (snapshot.running ? '' : ` · stopped (${snapshot.stopReason ?? 'not running'})`),
+      })
+    }
+
+    if (action === 'watch_stop') {
+      if (watcher.items.length === 0) throw new Error('no watch is configured')
+      watcher.stop('stopped by tool')
+      const snapshot = watcher.snapshot({ limit: 200 })
+      return present({ ok: true, action, ...snapshot, summary: `stopped after ${snapshot.collected} samples` })
+    }
+
+    if (action === 'capture') {
+      const wanted = Math.min(Math.max(toNumber(args?.samples, 'samples') ?? 100, 2), 2000)
+      const periodMs = toNumber(args?.periodMs, 'periodMs') ?? 20
+      const { items, skipped } = await watchItems(args?.symbols)
+      await resolveExe()
+      await ensureSession()
+      if (args?.resume === true && session.state !== 'running') await session.resume()
+      watcher.start(items, { periodMs, capacity: Math.max(wanted + 16, 64) })
+      const budget = Math.min(30000, Math.round(wanted * Math.max(5, periodMs) + 8000))
+      const waited = await watcher.waitFor(wanted, budget)
+      watcher.stop(waited.timedOut ? 'capture timed out' : 'capture complete')
+      const snapshot = watcher.snapshot({ limit: wanted })
+      return present({
+        ok: true,
+        action,
+        ...snapshot,
+        waited,
+        skipped: skipped.length === 0 ? undefined : skipped,
+        summary: `captured ${snapshot.collected} samples every ${snapshot.periodMs} ms from ${snapshot.items.length} point(s)`
+          + (session.state === 'running' ? '' : ' · target halted, values were constant'),
+      })
     }
 
     if (!session.isOpen) {
@@ -970,6 +1187,34 @@ export function apply(ctx, config = {}) {
           type: 'boolean',
           description: 'For connect: true leaves the core halted instead of resuming it.',
         },
+        symbols: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 24,
+          description: 'For watch and capture: symbol names, or paths such as "motor[0].electric_angle" or "foc_isr.uq_out[1]".',
+        },
+        periodMs: {
+          type: 'integer',
+          minimum: 5,
+          maximum: 5000,
+          description: 'For watch and capture: sampling period in milliseconds. Defaults to 20.',
+        },
+        samples: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 2000,
+          description: 'For watch_read: how many newest samples to return (default 60). For capture: how many samples to collect (default 100).',
+        },
+        waitMs: {
+          type: 'integer',
+          minimum: 0,
+          maximum: 60000,
+          description: 'For watch_read: wait up to this long until `samples` points exist. Defaults to 0 (return immediately).',
+        },
+        resume: {
+          type: 'boolean',
+          description: 'For watch and capture: resume the core first if it is halted, so samples actually change.',
+        },
       },
       required: ['action'],
       additionalProperties: false,
@@ -1030,6 +1275,7 @@ export function apply(ctx, config = {}) {
       await activate(exec.agent?.id)
       const config = await commanderConfig()
       const wasOpen = session.isOpen
+      watcher.stop('flashing')
       if (wasOpen) await session.close()
       if (idleTimer !== undefined) { clearTimeout(idleTimer); idleTimer = undefined }
       try {
@@ -1212,6 +1458,97 @@ export function apply(ctx, config = {}) {
           session.config = { ...resolved, ...target }
         }
         sendJson(res, 200, await workspacePanelState(sessionId))
+        return
+      }
+      res.writeHead(405, { allow: 'GET, POST' })
+      res.end()
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: String(error?.message ?? error) })
+    }
+  }
+
+  /**
+   * The sidebar panel's watch channel.
+   *
+   * GET returns the live trace: the newest samples of every point plus the run
+   * state, so the panel can draw a scrolling chart by polling. POST starts and
+   * stops sampling, and carries the two run-control buttons, because a watch on
+   * a halted core would draw a flat line.
+   */
+  const watchPanelState = (limit = 160) => {
+    if (watcher.items.length === 0) {
+      return present({
+        ok: true,
+        configured: false,
+        running: false,
+        session: session.isOpen ? 'open' : 'closed',
+        state: session.isOpen ? session.state : 'closed',
+        points: [],
+      })
+    }
+    const snapshot = watcher.snapshot({ limit })
+    return present({
+      ok: true,
+      configured: true,
+      running: snapshot.running,
+      session: session.isOpen ? 'open' : 'closed',
+      state: snapshot.state,
+      periodMs: snapshot.periodMs,
+      collected: snapshot.collected,
+      dropped: snapshot.dropped,
+      error: snapshot.error,
+      stopReason: snapshot.stopReason,
+      startedAt: snapshot.startedAt,
+      elapsedMs: snapshot.elapsedMs,
+      times: snapshot.times,
+      items: snapshot.items,
+      points: snapshot.items.map((item) => item.name),
+    })
+  }
+
+  const handleWatchRoute = async (req, res) => {
+    try {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const asked = Number(url.searchParams.get('limit') ?? 160)
+      const queryLimit = Number.isFinite(asked) ? Math.min(Math.max(Math.trunc(asked), 1), 1000) : 160
+      if (req.method === 'GET') {
+        // GET never calls activate(): polling a chart must not release the probe
+        // because the panel happens to belong to another workspace.
+        sendJson(res, 200, watchPanelState(queryLimit))
+        return
+      }
+      if (req.method === 'POST') {
+        const body = await readJsonBody(req)
+        const sessionId = typeof body?.session === 'string' && body.session.trim() !== ''
+          ? body.session.trim()
+          : undefined
+        const action = String(body?.action ?? 'status')
+        // Only the actions that pick a target may move the active workspace:
+        // stopping or clearing must never release a probe because a request
+        // arrived without a session id.
+        if (action === 'start' || action === 'resume') await activate(sessionId)
+        if (action === 'start') {
+          await startWatch({
+            symbols: body?.symbols,
+            periodMs: body?.periodMs,
+            resume: body?.resume === true,
+          })
+        } else if (action === 'stop') {
+          watcher.stop('stopped from the panel')
+          armIdle()
+        } else if (action === 'clear') {
+          watcher.clear()
+        } else if (action === 'resume') {
+          await resolveExe()
+          await ensureSession()
+          if (session.state !== 'running') await session.resume()
+        } else if (action === 'halt') {
+          if (session.isOpen) await session.halt()
+        } else if (action !== 'status') {
+          throw new Error(`unknown watch action: ${action}`)
+        }
+        const limit = Number(body?.limit ?? queryLimit)
+        sendJson(res, 200, watchPanelState(Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit), 1), 1000) : 160))
         return
       }
       res.writeHead(405, { allow: 'GET, POST' })
@@ -1415,7 +1752,13 @@ export function apply(ctx, config = {}) {
       path: DEVICES_PATH,
       handler: handleDevicesRoute,
     })
+    const disposeWatch = webServer.register({
+      kind: 'exact',
+      path: WATCH_PATH,
+      handler: handleWatchRoute,
+    })
     return () => {
+      disposeWatch()
       disposeDevices()
       disposeWorkspace()
       disposeConfig()
@@ -1423,6 +1766,7 @@ export function apply(ctx, config = {}) {
   })
 
   ctx.effect(() => () => {
+    watcher.stop('plugin unloaded')
     if (idleTimer !== undefined) clearTimeout(idleTimer)
     session.close().catch(() => {})
   }, 'mcu-debug-session')

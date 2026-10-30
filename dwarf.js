@@ -727,6 +727,60 @@ export class DwarfInfo {
     }
   }
 
+  /**
+   * Resolve a watch expression such as `motor[0].velocity_pid_data.reference`
+   * into a byte range of the image: one global variable plus member offsets and
+   * constant array indices.
+   *
+   * Pointers are not followed, a bit-field member has no byte range of its own,
+   * and an index into anything but an array is refused rather than guessed.
+   * Returns { variable, die, type, size, offset, address } or undefined.
+   */
+  resolveExpression(expression) {
+    const parsed = parseWatchPath(expression)
+    if (parsed === undefined) return undefined
+    const variable = this.variable(parsed.base)
+    if (variable === undefined || variable.address === undefined) return undefined
+    let die = variable.type
+    let offset = 0
+    for (const step of parsed.steps) {
+      const core = this.coreType(die)
+      if (core === undefined) return undefined
+      if (step.index !== undefined) {
+        if (core.tag !== TAG.arrayType) return undefined
+        const element = this.typeRef(core)
+        const stride = this.sizeOf(element)
+        if (element === undefined || stride === undefined) return undefined
+        offset += stride * step.index
+        die = element
+        continue
+      }
+      if (
+        core.tag !== TAG.structureType
+        && core.tag !== TAG.classType
+        && core.tag !== TAG.unionType
+      ) return undefined
+      const member = core.children.find((child) => child.tag === TAG.member
+        && stringOf(child.attrs[AT.name]) === step.name)
+      if (member === undefined) return undefined
+      // A bit-field occupies bits, not a byte range this reader could sample.
+      if (numberOf(member.attrs[AT.bitSize]) !== undefined) return undefined
+      offset += this.memberOffset(member)
+      die = this.typeRef(member)
+      if (die === undefined) return undefined
+    }
+    const size = this.sizeOf(die)
+    if (size === undefined) return undefined
+    return {
+      variable,
+      die,
+      type: this.typeLabel(die),
+      size,
+      offset,
+      address: variable.address + offset,
+    }
+  }
+
   typeRef(die, attribute = AT.type) {
     if (die === undefined) return undefined
     const offset = numberOf(die.attrs[attribute])
@@ -1259,6 +1313,28 @@ function finiteFloat(value) {
   if (value === Infinity) return '+Inf'
   if (value === -Infinity) return '-Inf'
   return value
+}
+
+/**
+ * Split `motor[0].velocity_pid_data.reference` into the base symbol and the
+ * steps that follow it. Only what a C watch needs: named members and constant
+ * array indices.
+ * @returns {{base:string, steps:Array<{name:string}|{index:number}>}|undefined}
+ */
+export function parseWatchPath(text) {
+  const source = String(text ?? '').trim()
+  const match = /^([A-Za-z_][A-Za-z0-9_$]*)((?:\[\d+\])*)((?:\.[A-Za-z_][A-Za-z0-9_$]*(?:\[\d+\])*)*)$/.exec(source)
+  if (match === null) return undefined
+  const steps = []
+  for (const index of match[2].matchAll(/\[(\d+)\]/g)) steps.push({ index: Number(index[1]) })
+  for (const part of match[3].split('.')) {
+    if (part === '') continue
+    const segment = /^([A-Za-z_][A-Za-z0-9_$]*)((?:\[\d+\])*)$/.exec(part)
+    if (segment === null) return undefined
+    steps.push({ name: segment[1] })
+    for (const index of segment[2].matchAll(/\[(\d+)\]/g)) steps.push({ index: Number(index[1]) })
+  }
+  return { base: match[1], steps }
 }
 
 function readUnsigned(bytes, offset, size) {

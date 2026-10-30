@@ -12,8 +12,17 @@ import { dirname, join } from 'node:path'
 import net from 'node:net'
 import { connectRsp, decodeHexBytes, encodeMonitor, parseStopReply } from './rsp.js'
 
-const STOP_GRACE_MS = 3000
 const CPUID_ADDRESS = 0xe000ed00
+// Debug Halting Control and Status Register: bit 17 says the core is halted
+// right now, even when the GDB server was never told about the stop.
+const DHCSR = 0xe000edf0
+const DHCSR_S_HALT = 1 << 17
+const MONITOR_TIMEOUT_MS = 3000
+// Background reads through the AHB-AP. A monitor packet is serviced while the
+// target keeps running; one packet carries at most this many 32-bit words so a
+// long read stays a bounded request.
+const AHB_TIMEOUT_MS = 2500
+const AHB_WORDS_PER_PACKET = 64
 // Flash Patch and Breakpoint unit. Comparators live in the debug power domain,
 // so a core reset does not clear them: one left armed by an earlier debugger
 // pins the core forever at its address, and `z1` cannot remove it because a
@@ -43,16 +52,6 @@ function wordAt(bytes, index) {
   return (bytes[index * 4] | (bytes[index * 4 + 1] << 8) | (bytes[index * 4 + 2] << 16) | (bytes[index * 4 + 3] << 24)) >>> 0
 }
 
-function withTimeout(promise, timeoutMs, label) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs)
-    promise.then(
-      (value) => { clearTimeout(timer); resolve(value) },
-      (error) => { clearTimeout(timer); reject(error) },
-    )
-  })
-}
-
 async function freePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer()
@@ -77,10 +76,12 @@ export class ProbeSession {
   #chain = Promise.resolve()
   #child
   #rsp
-  #stopPromise
   #stdout = ''
   #probe
   #identity
+  /** 'on'/'off' once a background read has told us whether `ReadMemAP` works. */
+  #ahb
+  #ahbError
 
   constructor(config) {
     this.config = config
@@ -218,20 +219,15 @@ export class ProbeSession {
     return this.#serialize(async () => {
       if (!this.isOpen) return { session: 'closed' }
       try {
-        if (this.state === 'running') {
-          this.#rsp?.interrupt()
-          await withTimeout(Promise.resolve(this.#stopPromise), 1500, 'stop before close').catch(() => {})
+        // Leave the target running, but without a breakpoint the probe would
+        // stop on: clear them first so `go` below really starts the firmware.
+        if (this.state === 'running') await this.#haltCore().catch(() => {})
+        for (const [address, kind] of this.breakpoints) {
+          await this.#rsp?.request(`${kind === 'sw' ? 'z0' : 'z1'},${address.toString(16)},2`, 1000).catch(() => {})
         }
-        if (this.state !== 'running') {
-          for (const [address, kind] of this.breakpoints) {
-            await this.#rsp?.request(`${kind === 'sw' ? 'z0' : 'z1'},${address.toString(16)},2`, 1000).catch(() => {})
-          }
-          await this.#disarmAllComparators()
-          // `c` is the only packet that actually resumes the core here;
-          // `monitor go` is accepted and ignored by this server.
-          this.#rsp?.request('c', 0).catch(() => {})
-          await new Promise((resolve) => setTimeout(resolve, 150))
-        }
+        await this.#disarmAllComparators()
+        await this.#monitor('go', 1500).catch(() => {})
+        await new Promise((resolve) => setTimeout(resolve, 150))
       } catch {
         // teardown continues regardless
       }
@@ -239,32 +235,46 @@ export class ProbeSession {
       this.#rsp = undefined
       this.#child?.kill()
       this.#child = undefined
-      this.#stopPromise = undefined
       this.state = 'closed'
       this.breakpoints.clear()
       return { session: 'closed' }
     })
   }
 
-  /** Start the core running. Returns immediately; the stop surfaces later. */
+  /**
+   * Start the core running. Returns immediately; a stop surfaces on refresh().
+   */
   resume() {
-    return this.#serialize(() => this.#resumeCore())
+    return this.#serialize(async () => {
+      // A silent breakpoint stop leaves `state` stale, so ask the core first:
+      // otherwise "resume" after a hit would be a no-op that claims success.
+      if (this.state === 'running') await this.#refreshState()
+      return this.#resumeCore()
+    })
   }
 
-  /** Stop the core and return why it stopped. */
+  /** Stop the core and report why it stopped. */
   halt() {
     return this.#serialize(() => this.#haltCore())
   }
 
-  // RSP is strictly sequential: while `c` is outstanding no other packet may be
-  // sent, or the reply order desynchronises and a later reply resolves `c`.
-  // Every packet therefore goes through #send, which refuses to run while the
-  // core is running; only #resumeCore may leave `c` pending.
+  // RSP is request/reply except for monitor packets, which the server services
+  // even while the core runs. `#send` is for ordinary packets and refuses to
+  // run while the target is running; `#monitor` is safe in both states.
   #send(body, timeoutMs) {
     if (this.state === 'running') {
       throw new Error(`internal: refusing to send "${body.slice(0, 16)}" while the core is running`)
     }
     return this.#rsp.request(body, timeoutMs)
+  }
+
+  /** Run one J-Link monitor command and return its text output. */
+  async #monitor(command, timeoutMs = MONITOR_TIMEOUT_MS) {
+    if (this.#rsp === undefined) throw new Error('no open session; call connect first')
+    const reply = await this.#rsp.request(`qRcmd,${encodeMonitor(command)}`, timeoutMs)
+    const text = monitorText(reply)
+    if (/^ERROR:/i.test(text.trim())) throw new Error(`${command}: ${text.trim()}`)
+    return text
   }
 
   async #resumeCore() {
@@ -277,22 +287,67 @@ export class ProbeSession {
       const pc = wordAt(bytes, 15)
       if (this.breakpoints.has(pc)) await this.#send('s', 10000)
     }
+    // `monitor go` returns immediately and, unlike `c`, leaves no packet pending
+    // that would impede the background reads a watch needs. The price is that a
+    // breakpoint stop is silent; refresh() finds it through DHCSR.
+    await this.#monitor('go', MONITOR_TIMEOUT_MS)
     this.state = 'running'
-    this.#stopPromise = this.#rsp.request('c', 0).then((reply) => {
-      this.state = 'halted'
-      this.lastStop = parseStopReply(reply) ?? { kind: 'unknown' }
-      return this.lastStop
-    })
-    this.#stopPromise.catch(() => { this.state = 'closed' })
+    this.lastStop = undefined
     return { state: 'running' }
   }
 
   async #haltCore() {
     if (!this.isOpen) throw new Error('no open session; call connect first')
     if (this.state !== 'running') return { state: this.state, stop: this.lastStop }
-    this.#rsp.interrupt()
-    const stop = await withTimeout(Promise.resolve(this.#stopPromise), STOP_GRACE_MS, 'halt')
-    return { state: this.state, stop }
+    // The server may still believe the core runs after it stopped on a hardware
+    // breakpoint, so sync through `halt` instead of sending an interrupt.
+    await this.#monitor('halt', MONITOR_TIMEOUT_MS)
+    this.state = 'halted'
+    this.lastStop = await this.#inferStop()
+    return { state: this.state, stop: this.lastStop }
+  }
+
+  /** PC and the reason the core stopped, read while it is halted. */
+  async #inferStop() {
+    try {
+      const bytes = decodeHexBytes(await this.#send('g'))
+      if (bytes.length < 68) return { kind: 'halt' }
+      const pc = wordAt(bytes, 15)
+      if (this.breakpoints.has(pc)) return { kind: 'breakpoint', address: hex(pc), fields: { pc: hex(pc) } }
+      return { kind: 'halt', fields: { pc: hex(pc) } }
+    } catch {
+      return { kind: 'halt' }
+    }
+  }
+
+  /**
+   * Detect a stop the server never reported.
+   *
+   * `monitor go` has no stop reply, so a breakpoint hit leaves the core halted
+   * while this session still believes it runs. DHCSR.S_HALT is the truth and
+   * costs one 4-byte background read. When it says halted, one `monitor halt`
+   * brings the server in sync, after which the registers are real.
+   */
+  refresh() {
+    return this.#serialize(() => this.#refreshState())
+  }
+
+  /** The body of refresh, for callers already inside a serialized task. */
+  async #refreshState() {
+    if (!this.isOpen || this.state !== 'running') return { state: this.state, stop: this.lastStop }
+    const dhcsr = await this.#ahbWord(DHCSR)
+    if (dhcsr === undefined || (dhcsr & DHCSR_S_HALT) === 0) return { state: 'running' }
+    await this.#monitor('halt', MONITOR_TIMEOUT_MS).catch(() => {})
+    this.state = 'halted'
+    this.lastStop = await this.#inferStop()
+    return { state: this.state, stop: this.lastStop }
+  }
+
+  /** One 32-bit read over the AHB-AP, or undefined when that is unavailable. */
+  async #ahbWord(address) {
+    const bytes = await this.#ahbRead(address, 4)
+    if (bytes === undefined || bytes.length < 4) return undefined
+    return (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0
   }
 
   /** Step one instruction, or several. Leaves the core halted. */
@@ -321,20 +376,113 @@ export class ProbeSession {
   }
 
   readMemory(address, length) {
-    return this.#serialize(() => this.#withHalt(async () => {
-      const bytes = []
-      const packetBudget = Math.min(this.#packetBytes(), 1000)
-      while (bytes.length < length) {
-        const remaining = length - bytes.length
-        const chunk = Math.min(remaining, packetBudget)
-        const reply = await this.#send(`m${(address + bytes.length).toString(16)},${chunk.toString(16)}`)
-        if (!/^[0-9a-fA-F]+$/.test(reply)) throw new Error(rspFailure(reply, 'read memory'))
-        const decoded = decodeHexBytes(reply)
-        if (decoded.length === 0) break
-        bytes.push(...decoded)
+    return this.#serialize(async () => {
+      if (!this.isOpen) throw new Error('no open session; call connect first')
+      // While the core runs, memory is read through the MEM-AP: the probe does
+      // the access on the bus and the CPU keeps executing. Only if that channel
+      // is unavailable does this fall back to the old halt-read-resume window.
+      if (this.state === 'running') {
+        const bytes = await this.#ahbRead(address, length)
+        if (bytes !== undefined) {
+          return { state: this.state, address, length: bytes.length, bytes, background: true }
+        }
       }
-      return { state: this.state, address, length: bytes.length, bytes }
-    }))
+      return this.#withHalt(async () => {
+        const bytes = await this.#readHalted(address, length)
+        return { state: this.state, address, length: bytes.length, bytes }
+      })
+    })
+  }
+
+  /** The classic `m` read: requires the core stopped. */
+  async #readHalted(address, length) {
+    const bytes = []
+    const packetBudget = Math.min(this.#packetBytes(), 1000)
+    while (bytes.length < length) {
+      const remaining = length - bytes.length
+      const chunk = Math.min(remaining, packetBudget)
+      const reply = await this.#send(`m${(address + bytes.length).toString(16)},${chunk.toString(16)}`)
+      if (!/^[0-9a-fA-F]+$/.test(reply)) throw new Error(rspFailure(reply, 'read memory'))
+      const decoded = decodeHexBytes(reply)
+      if (decoded.length === 0) break
+      bytes.push(...decoded)
+    }
+    return bytes
+  }
+
+  /**
+   * Read memory without touching the run state.
+   *
+   * This is the sampling primitive: when the core runs, `qRcmd ReadMemAP` is
+   * serviced while the continue is still outstanding, so a watch costs the
+   * target nothing but a few AHB-AP transactions. When the core is stopped the
+   * regular `m` packet is used. Returns raw bytes; the caller owns decoding.
+   */
+  readSnapshot(address, length) {
+    return this.#serialize(async () => {
+      if (!this.isOpen) throw new Error('no open session; call connect first')
+      if (this.state === 'running') {
+        const bytes = await this.#ahbRead(address, length)
+        if (bytes !== undefined) return bytes
+        return this.#withHalt(() => this.#readHalted(address, length))
+      }
+      return this.#readHalted(address, length)
+    })
+  }
+
+  /**
+   * Read through the AHB-AP without stopping the core, one monitor command per
+   * 256-byte window. Returns undefined when this build of the GDB server does
+   * not answer `ReadMemAP`; throws when the probe answers with an error.
+   */
+  async #ahbRead(address, length) {
+    if (this.#ahb === 'off' || this.#rsp === undefined) return undefined
+    const out = []
+    while (out.length < length) {
+      const remaining = length - out.length
+      const at = address + out.length
+      // `& ~3` yields a signed 32-bit value for PPB addresses, which would be
+      // formatted as a negative number and rejected by the probe.
+      const start = (at & ~3) >>> 0
+      const skip = at - start
+      const words = Math.min(Math.ceil((skip + remaining) / 4), AHB_WORDS_PER_PACKET)
+      const command = `ReadMemAP 0x0,0x${start.toString(16)},${words},0`
+      let text
+      try {
+        text = monitorText(await this.#rsp.request(`qRcmd,${encodeMonitor(command)}`, AHB_TIMEOUT_MS))
+      } catch (error) {
+        // A timeout means the probe is busy, not that the command is missing.
+        this.#ahbError = error.message
+        return undefined
+      }
+      const match = text.match(/O\.K\.:\s*((?:0[xX][0-9a-fA-F]+[,\s]*)+)/)
+      if (match === null) {
+        if (/unsupported|unknown command/i.test(text) || text.trim() === '') this.#ahb = 'off'
+        this.#ahbError = text.trim().slice(0, 120) || 'empty monitor reply'
+        return undefined
+      }
+      if (this.#ahb === undefined) this.#ahb = 'on'
+      const packet = []
+      for (const part of match[1].split(',')) {
+        const value = Number.parseInt(part.trim().replace(/^0[xX]/, ''), 16)
+        if (!Number.isFinite(value)) continue
+        for (let i = 0; i < 4; i += 1) packet.push((value >>> (i * 8)) & 0xff)
+      }
+      const take = Math.min(remaining, Math.max(0, packet.length - skip))
+      if (take === 0) break
+      out.push(...packet.slice(skip, skip + take))
+    }
+    return out
+  }
+
+  /** Whether background (non-halting) reads are in use. */
+  get backgroundReads() {
+    return this.#ahb !== 'off'
+  }
+
+  /** Diagnostics for why a background read did or did not work. */
+  get backgroundStatus() {
+    return { enabled: this.#ahb !== 'off', probed: this.#ahb, error: this.#ahbError }
   }
 
   writeMemory(address, bytes) {
@@ -423,6 +571,18 @@ function rspFailure(reply, what) {
   if (reply === undefined || reply === '') return `${what} failed: empty reply`
   if (reply.startsWith('E')) return `${what} failed: target returned ${reply}`
   return `${what} failed: unexpected reply "${reply.slice(0, 40)}"`
+}
+
+/**
+ * Decode a monitor reply. The GDB server sends a command's text output as the
+ * hex-encoded reply body, while an unsolicited/empty packet arrives verbatim.
+ */
+export function monitorText(reply) {
+  if (typeof reply !== 'string' || reply === '') return ''
+  if (reply.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(reply)) {
+    return Buffer.from(reply, 'hex').toString('latin1')
+  }
+  return reply
 }
 
 /** Parse the probe identity out of the server banner. */
