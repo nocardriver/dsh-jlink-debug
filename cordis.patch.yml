@@ -5,4 +5,6 @@
         device: STM32H503CB
         interface: SWD
         speedKhz: 4000
-        maxReadBytes: 512
+        # Large enough for a whole FOC_motor_dev[4] (704 B); raise it in
+        # Settings → J-Link runtime when a struct or array is bigger.
+        maxReadBytes: 1024

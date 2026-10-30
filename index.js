@@ -19,6 +19,7 @@ import {
   searchDevices,
 } from './devices.js'
 import { findSymbol, loadSymbols, nearestSymbol } from './elf.js'
+import { loadDebugInfo } from './dwarf.js'
 import { findJLink, perform } from './jlink.js'
 import { ProbeSession } from './session.js'
 
@@ -106,7 +107,7 @@ export const Config = Schema.object({
 const ACTIONS = [
   'status', 'connect', 'disconnect', 'halt', 'resume', 'step',
   'registers', 'read_memory', 'write_memory', 'breakpoint', 'reset',
-  'symbols', 'resolve',
+  'symbols', 'type', 'resolve',
 ]
 
 const DESCRIPTION = [
@@ -119,11 +120,12 @@ const DESCRIPTION = [
   'resume — let the core run (it stops again on a breakpoint);',
   'step — advance N instructions (count, default 1) and stay halted;',
   'registers — core registers r0-r12, sp, lr, pc, xpsr plus the active exception;',
-  'read_memory — read a byte range;',
+  'read_memory — read a byte range; with a symbol it also decodes the DWARF type into named fields;',
   'write_memory — write hex bytes to RAM or peripheral space;',
   'breakpoint — set (default) or clear a hardware breakpoint at address;',
   'reset — reset the core and hold it at the reset vector;',
-  'symbols — list or search names from the firmware .elf symbol table;',
+  'symbols — list or search names from the firmware .elf symbol table (objects carry their DWARF type);',
+  'type — show a DWARF type layout: fields, offsets and enum values, for a type name or a variable;',
   'resolve — turn one symbol name into its address.',
   'read_memory, write_memory and breakpoint also accept `symbol` instead of `address`,',
   'and a read whose length is omitted reads the whole symbol (up to maxReadBytes).',
@@ -135,7 +137,7 @@ const FLASH_DESCRIPTION = [
   'Program a firmware image into flash over SEGGER J-Link, verify it and start the core.',
   'Accepts an .elf, .hex or .bin file. Any open debug session is closed first, because the',
   'probe can only be owned by one process, and reopened afterwards. An .elf also becomes',
-  'the symbol source for this session, so read_memory and breakpoint can take names.',
+  'the symbol and DWARF type source for this session, so read_memory can decode struct fields and breakpoint can take names.',
 ].join(' ')
 
 function toNumber(value, name) {
@@ -202,6 +204,7 @@ function describeCall(args) {
   if (action === 'write_memory') return { card: 'generic', title: `MCU write ${where ?? 'memory'}`, kind: 'edit' }
   if (action === 'breakpoint') return { card: 'generic', title: `MCU breakpoint ${args?.clear === true ? 'clear' : 'set'} ${where ?? ''}`.trim(), kind: 'other' }
   if (action === 'symbols') return { card: 'generic', title: args?.query ? `MCU symbols "${args.query}"` : 'MCU symbols', kind: 'read' }
+  if (action === 'type') return { card: 'generic', title: `MCU type ${args?.name ?? '?'}`, kind: 'read' }
   if (action === 'resolve') return { card: 'generic', title: `MCU resolve ${args?.name ?? '?'}`, kind: 'read' }
   if (action === 'step') return { card: 'generic', title: `MCU step ${args?.count ?? 1}`, kind: 'execute' }
   if (action === 'registers') return { card: 'generic', title: 'MCU registers', kind: 'other' }
@@ -271,6 +274,10 @@ export function apply(ctx, config = {}) {
   let symbolsSource
   /** Why the last symbol load failed; kept so `status` can explain an empty lookup. */
   let symbolsError
+  /** Parsed DWARF type table for the same image (absent on stripped builds). */
+  let dwarf
+  let dwarfSource
+  let dwarfError
   /** The workspace and target the current call, and the live session, belong to. */
   let active
 
@@ -376,6 +383,9 @@ export function apply(ctx, config = {}) {
       symbols = undefined
       symbolsSource = undefined
       symbolsError = undefined
+      dwarf = undefined
+      dwarfSource = undefined
+      dwarfError = undefined
     }
     session.config = { ...resolved, ...target }
     active = { workspace, target, signature, elfFile: entry?.elfFile }
@@ -448,6 +458,41 @@ export function apply(ctx, config = {}) {
   /** A symbol table only annotates the image the current workspace points at. */
   const liveSymbols = () => (symbolsSource === active?.elfFile ? symbols : undefined)
 
+  /**
+   * Load the DWARF type table for the same image as the symbols.
+   *
+   * DWARF is optional: a stripped Release build must still get names, addresses
+   * and raw bytes. `required` is therefore false for `symbols`/`read_memory`
+   * and true only for the explicit `type` action.
+   */
+  const loadDebugTable = async (required) => {
+    const source = active?.elfFile
+    if (!source) {
+      if (required) {
+        throw new Error(
+          'no firmware image for type lookup: flash an .elf with mcu_flash, '
+          + 'or pass `file` with the .elf you built',
+        )
+      }
+      return undefined
+    }
+    if (dwarf !== undefined && dwarfSource === source) return dwarf
+    try {
+      dwarf = await loadDebugInfo(source)
+      dwarfSource = source
+      dwarfError = undefined
+    } catch (error) {
+      dwarf = undefined
+      dwarfSource = undefined
+      dwarfError = `${source}: ${error.message}`
+      if (required) throw new Error(`cannot read DWARF from ${dwarfError}`)
+    }
+    return dwarf
+  }
+
+  /** DWARF annotations belong to the live image, exactly like symbols. */
+  const liveDebug = () => (dwarfSource === active?.elfFile ? dwarf : undefined)
+
   /** ARM Thumb keeps bit 0 set in st_value; the probe wants the even address. */
   const evenAddress = (value) => value & ~1
 
@@ -482,22 +527,38 @@ export function apply(ctx, config = {}) {
   }
 
   /** A compact, JSON-safe view of one symbol for tool results. */
-  const describeSymbol = (symbol) => ({
-    name: symbol.name,
-    address: hex8(evenAddress(symbol.address)),
-    size: symbol.size,
-    kind: symbol.kind,
-  })
+  const describeSymbol = (symbol) => {
+    const described = {
+      name: symbol.name,
+      address: hex8(evenAddress(symbol.address)),
+      size: symbol.size,
+      kind: symbol.kind,
+    }
+    // Objects are the only entries DWARF can describe; functions keep their
+    // signature out of this compact view (use `type` for a named type).
+    if (symbol.kind === 'object') {
+      const info = liveDebug()?.typeForSymbol(symbol)
+      if (info !== undefined) {
+        described.type = info.name
+        if (info.size !== undefined) described.typeSize = info.size
+      }
+    }
+    return described
+  }
 
   /** What symbol lookups currently answer from; shown by `status`. */
   const elfSummary = () => {
     const table = liveSymbols()
-    return present({
+    const debug = liveDebug()
+    const summary = {
       file: active?.elfFile ?? '',
       symbols: table === undefined ? 0 : table.symbols.length,
       functions: table === undefined ? 0 : table.funcs.length,
       error: symbolsError,
-    })
+    }
+    if (debug !== undefined) summary.dwarf = debug.summary()
+    else if (dwarfError !== undefined) summary.dwarfError = dwarfError
+    return present(summary)
   }
 
   function stopName(stop) {
@@ -530,6 +591,7 @@ export function apply(ctx, config = {}) {
       // `status` is the cheap poll, so it is also the right place to warm the
       // symbol cache: a failed load stays reported instead of breaking status.
       if (active?.elfFile !== undefined && liveSymbols() === undefined) await loadSymbolTable(false)
+      if (active?.elfFile !== undefined && liveDebug() === undefined) await loadDebugTable(false)
       const elf = elfSummary()
       if (session.isOpen) {
         const info = session.describe()
@@ -575,6 +637,7 @@ export function apply(ctx, config = {}) {
     // Symbol lookup reads the image on the host, so it needs no probe at all.
     if (action === 'symbols') {
       const table = await loadSymbolTable(true)
+      await loadDebugTable(false)
       const query = String(args?.query ?? '').trim()
       const kind = String(args?.kind ?? 'any').trim()
       if (kind !== 'any' && kind !== 'func' && kind !== 'object') {
@@ -582,9 +645,15 @@ export function apply(ctx, config = {}) {
       }
       const limit = Math.min(Math.max(toNumber(args?.limit, 'limit') ?? 40, 1), 500)
       const needle = query.toLowerCase()
-      const matches = table.symbols.filter((symbol) =>
-        (kind === 'any' || symbol.kind === kind)
-        && (needle === '' || symbol.name.toLowerCase().includes(needle)))
+      const matches = table.symbols.filter((symbol) => {
+        if (kind !== 'any' && symbol.kind !== kind) return false
+        if (needle === '') return true
+        if (symbol.name.toLowerCase().includes(needle)) return true
+        // Searching a type name should find the variables of that type, which
+        // is how an agent gets from "FOC_motor_dev" to `motor` without a scan.
+        const type = liveDebug()?.typeForSymbol(symbol)
+        return type !== undefined && type.name.toLowerCase().includes(needle)
+      })
       const shown = matches.slice(0, limit).map(describeSymbol)
       return {
         ok: true,
@@ -603,17 +672,21 @@ export function apply(ctx, config = {}) {
 
     if (action === 'resolve') {
       const table = await loadSymbolTable(true)
+      await loadDebugTable(false)
       const name = String(args?.name ?? '').trim()
       if (name === '') throw new Error('resolve needs `name`')
       const symbol = findSymbol(table, name)
       if (symbol !== undefined) {
+        const described = describeSymbol(symbol)
         return {
           ok: true,
           action,
           source: table.path,
           found: true,
-          symbol: describeSymbol(symbol),
-          summary: `${symbol.name} = ${hex8(evenAddress(symbol.address))}${symbol.size > 0 ? ` (${symbol.size} B)` : ''}`,
+          symbol: described,
+          summary: `${symbol.name} = ${hex8(evenAddress(symbol.address))}`
+            + (symbol.size > 0 ? ` (${symbol.size} B)` : '')
+            + (described.type === undefined ? '' : ` · ${described.type}`),
         }
       }
       const needle = name.toLowerCase()
@@ -630,6 +703,55 @@ export function apply(ctx, config = {}) {
         summary: candidates.length === 0
           ? `no symbol matches "${name}"`
           : `"${name}" is not a symbol; did you mean ${candidates.map((entry) => entry.name).join(', ')}?`,
+      }
+    }
+
+    // Type lookup is host-only too; no probe is needed.
+    if (action === 'type') {
+      const debug = await loadDebugTable(true)
+      const name = String(args?.name ?? '').trim()
+      if (name === '') throw new Error('type needs `name` (a type name or a variable symbol)')
+      const depth = Math.min(Math.max(toNumber(args?.depth, 'depth') ?? 2, 1), 6)
+      let die = debug.typeByName(name)
+      let target = 'type'
+      if (die === undefined) {
+        const variable = debug.variable(name)
+        if (variable !== undefined) {
+          die = variable.type
+          target = 'variable'
+        }
+      }
+      if (die === undefined) {
+        const needle = name.toLowerCase()
+        const candidates = [...new Set([
+          ...debug.typesByName.keys(),
+          ...debug.variablesByName.keys(),
+        ])].filter((entry) => entry.toLowerCase().includes(needle)).slice(0, 8)
+        return {
+          ok: true,
+          action,
+          source: debug.path,
+          found: false,
+          candidates,
+          summary: candidates.length === 0
+            ? `no DWARF type or variable matches "${name}"`
+            : `"${name}" is not a type or variable; did you mean ${candidates.join(', ')}?`,
+        }
+      }
+
+      const layout = debug.describeType(die, { depth })
+      const parts = [layout.name ?? name, layout.kind]
+      if (layout.size !== undefined) parts.push(`${layout.size} B`)
+      if (Array.isArray(layout.members)) parts.push(`${layout.members.length} fields`)
+      if (Array.isArray(layout.values)) parts.push(`${layout.values.length} values`)
+      return {
+        ok: true,
+        action,
+        source: debug.path,
+        found: true,
+        target,
+        type: layout,
+        summary: parts.filter((part) => part !== undefined && part !== '').join(' · '),
       }
     }
 
@@ -687,14 +809,47 @@ export function apply(ctx, config = {}) {
       const fallback = target.symbol !== undefined && target.symbol.size > 0 ? target.symbol.size : 64
       const length = Math.max(1, Math.min(toNumber(args?.length, 'length') ?? fallback, resolved.maxReadBytes))
       const result = await session.readMemory(target.address, length)
+
+      // Decode the raw bytes through DWARF when the image carries types. A
+      // short read is left undecoded rather than reporting half a struct.
+      let value
+      let valueType
+      let valueSize
+      let valueNote
+      let valuePartial
+      const debug = target.symbol === undefined ? undefined : await loadDebugTable(false)
+      if (target.symbol !== undefined && debug !== undefined) {
+        const variable = debug.variableFor(target.symbol)
+        if (variable !== undefined) {
+          const declared = debug.sizeOf(variable.type)
+          if (declared !== undefined) {
+            valueType = debug.typeLabel(variable.type)
+            valueSize = declared
+            const depth = Math.min(Math.max(toNumber(args?.depth, 'depth') ?? 4, 1), 8)
+            value = debug.decode(variable.type, result.bytes, { depth })
+            if (result.bytes.length < declared) {
+              valuePartial = true
+              valueNote = `decoded the values that fit in the first ${result.bytes.length} of ${declared} bytes; `
+                + `pass length=${declared} (and raise Max read bytes if needed) for the full value`
+            }
+          }
+        }
+      }
+
       return {
         ok: true,
         action,
         state: result.state,
         memory: formatMemory(target.address, result.bytes),
         symbol: target.symbol === undefined ? undefined : describeSymbol(target.symbol),
+        value,
+        valueType,
+        valueSize,
+        valuePartial,
+        valueNote,
         summary: `read ${result.bytes.length} bytes at ${hex8(target.address)}`
-          + (target.symbol === undefined ? '' : ` (${target.symbol.name})`),
+          + (target.symbol === undefined ? '' : ` (${target.symbol.name})`)
+          + (value === undefined ? '' : ` · ${valueType}`),
       }
     }
 
@@ -789,7 +944,13 @@ export function apply(ctx, config = {}) {
         },
         name: {
           type: 'string',
-          description: 'For resolve: the exact symbol name to turn into an address.',
+          description: 'For resolve: the exact symbol name. For type: a type name or the name of a variable whose type should be shown.',
+        },
+        depth: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 8,
+          description: 'For type and decoded read_memory: how many nesting levels of structs/arrays to expand. Defaults to 2 for type and 4 for reads.',
         },
         bytes: {
           type: 'string',
@@ -887,6 +1048,7 @@ export function apply(ctx, config = {}) {
             elfFile: result.file,
           })
           await loadSymbolTable(false)
+          await loadDebugTable(false)
         }
         return present({
           ok: true,

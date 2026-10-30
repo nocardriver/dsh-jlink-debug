@@ -1,5 +1,6 @@
 /**
- * Client half: renders the `mcu_debug` tool call as a register / hexdump card.
+ * Client half: renders the `mcu_debug` tool call as a register / hexdump /
+ * decoded-struct / type-layout card.
  *
  * The card reads only durable tool-call data, so it needs no Client→Host RPC:
  * what the agent saw is exactly what the user sees. Sections are chosen from
@@ -22,6 +23,7 @@ window.__ModuleLoader__.load({
       'reset.title': 'Reset',
       'flash.title': 'Flash',
       'symbols.title': 'Symbols',
+      'type.title': 'Type layout',
       'resolve.title': 'Resolve',
       'field.core': 'Core',
       'field.device': 'Device',
@@ -39,9 +41,14 @@ window.__ModuleLoader__.load({
       'field.name': 'Name',
       'field.size': 'Size',
       'field.kind': 'Kind',
+      'field.type': 'Type',
+      'field.offset': 'Offset',
+      'field.value': 'Value',
+      'field.partial': 'partial',
       'field.file': 'Image',
       'field.symbols': 'symbols',
       'field.functions': 'functions',
+      'field.types': 'types',
       'field.candidates': 'Candidates',
       'hint.running': 'Querying the probe…',
       'panel.nav': 'J-Link Debug',
@@ -106,6 +113,7 @@ window.__ModuleLoader__.load({
       'reset.title': '复位',
       'flash.title': '烧录',
       'symbols.title': '符号',
+      'type.title': '类型布局',
       'resolve.title': '符号解析',
       'field.core': '内核',
       'field.device': '器件',
@@ -123,9 +131,14 @@ window.__ModuleLoader__.load({
       'field.name': '名称',
       'field.size': '大小',
       'field.kind': '类型',
+      'field.type': '类型',
+      'field.offset': '偏移',
+      'field.value': '值',
+      'field.partial': '部分',
       'field.file': '镜像',
       'field.symbols': '个符号',
       'field.functions': '个函数',
+      'field.types': '个类型',
       'field.candidates': '候选',
       'hint.running': '正在查询探针…',
       'panel.nav': 'J-Link 调试',
@@ -321,11 +334,16 @@ window.__ModuleLoader__.load({
         cell(t('field.size'), 44, false),
         cell(t('field.name'), undefined, false),
         cell(t('field.kind'), 52, false))
-      const rows = entries.map((entry, index) => h('div', { key: index, style: S.row },
-        cell(String(entry?.address ?? ''), 92, true),
-        cell(entry?.size === 0 || entry?.size === undefined ? '—' : String(entry.size), 44, true),
-        cell(String(entry?.name ?? ''), undefined, false),
-        cell(String(entry?.kind ?? ''), 52, true)))
+      const rows = entries.map((entry, index) => {
+        // `resolve` suggestions are symbol-like objects; a `type` miss returns
+        // plain names. Normalize so both render as table rows.
+        const item = typeof entry === 'string' ? { name: entry } : entry
+        return h('div', { key: index, style: S.row },
+          cell(String(item?.address ?? ''), 92, true),
+          cell(item?.size === 0 || item?.size === undefined ? '—' : String(item.size), 44, true),
+          cell(String(item?.name ?? '') + (item?.type === undefined ? '' : '  ' + String(item.type)), undefined, false),
+          cell(String(item?.kind ?? ''), 52, true))
+      })
       return h('div', { style: { ...S.hexdump, display: 'flex', flexDirection: 'column' } }, [head, ...rows])
     }
 
@@ -344,8 +362,81 @@ window.__ModuleLoader__.load({
         parts.push(elf.functions + ' ' + t('field.functions'))
       }
       if (typeof elf.error === 'string' && elf.error !== '') parts.push(elf.error)
+      if (typeof elf.dwarfError === 'string' && elf.dwarfError !== '') parts.push(elf.dwarfError)
+      if (typeof elf.dwarf === 'object' && elf.dwarf !== null && typeof elf.dwarf.types === 'number') {
+        parts.push(elf.dwarf.types + ' ' + t('field.types'))
+      }
       if (parts.length === 0) return null
       return h('div', { key: 'elf', style: S.summary }, t('field.file') + ': ' + parts.join(' · '))
+    }
+
+    /** Member rows shared by a `type` result and an array's element type. */
+    function typeMembers(t, members) {
+      if (!Array.isArray(members) || members.length === 0) return null
+      const cell = (text, width, muted) => h('span', {
+        style: {
+          ...S.mono,
+          flex: width === undefined ? '1 1 auto' : `0 0 ${width}px`,
+          ...(muted === true ? { color: 'var(--dsw-alias-label-secondary)' } : {}),
+        },
+      }, text)
+      const head = h('div', { key: 'head', style: { ...S.row, fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+        cell(t('field.offset'), 54, false),
+        cell(t('field.size'), 42, false),
+        cell(t('field.name'), undefined, false),
+        cell(t('field.type'), undefined, false))
+      const rows = members.map((member, index) => h('div', { key: index, style: S.row },
+        cell(member?.offset === undefined ? '—' : String(member.offset), 54, true),
+        cell(member?.size === undefined ? '—' : String(member.size), 42, true),
+        cell(String(member?.name ?? ''), undefined, false),
+        cell(String(member?.type ?? ''), undefined, true)))
+      return h('div', { style: { ...S.hexdump, display: 'flex', flexDirection: 'column' } }, [head, ...rows])
+    }
+
+    /** Render the `type` action's layout tree: members, enum values, array element. */
+    function typeLayout(t, data) {
+      const node = data?.type
+      if (node === null || typeof node !== 'object') return null
+      const children = [h('div', { key: 'head', style: { ...S.summary, fontFamily: MONO } },
+        String(node.name ?? '') + '  ' + String(node.kind ?? '')
+        + (node.size === undefined ? '' : '  ' + String(node.size) + ' B'))]
+      const members = typeMembers(t, node.members)
+      if (members !== null) children.push(h('div', { key: 'members' }, members))
+      if (Array.isArray(node.values) && node.values.length > 0) {
+        children.push(h('div', { key: 'values', style: { ...S.hexdump, display: 'flex', flexDirection: 'column' } },
+          node.values.map((entry, index) => h('div', { key: index, style: S.row },
+            h('span', { style: { ...S.mono, flex: '0 0 220px' } }, String(entry?.name ?? '')),
+            h('span', { style: S.mono }, String(entry?.value ?? ''))))))
+      }
+      const element = node.elementType
+      if (element !== null && typeof element === 'object') {
+        children.push(h('div', { key: 'elem-head', style: S.summary },
+          String(element.name ?? '') + ' [' + String(node.count ?? '?') + ']'))
+        const inner = typeMembers(t, element.members)
+        if (inner !== null) children.push(h('div', { key: 'element' }, inner))
+      }
+      return h('div', { key: 'type', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, children)
+    }
+
+    /** Render the decoded value of a symbol read, with its DWARF type name. */
+    function decodedValue(t, data) {
+      if (data === null || typeof data !== 'object' || data.value === undefined) return null
+      const label = String(data.valueType ?? t('field.value'))
+        + (data.valuePartial === true ? ' (' + t('field.partial') + ')' : '')
+      return h('div', { key: 'decoded', style: { ...S.hexdump, display: 'flex', flexDirection: 'column', gap: 4 } }, [
+        h('div', { key: 'label', style: S.summary }, label),
+        h('pre', {
+          key: 'body',
+          style: {
+            ...S.mono,
+            margin: 0,
+            maxHeight: 360,
+            overflow: 'auto',
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+          },
+        }, JSON.stringify(data.value, null, 2)),
+      ])
     }
 
     /** Read the call arguments from whichever shape the current stage exposes. */
@@ -417,6 +508,7 @@ window.__ModuleLoader__.load({
         return '"' + args.query + '"'
       }
       if (args.action === 'resolve' && typeof args.name === 'string') return args.name
+      if (args.action === 'type' && typeof args.name === 'string') return args.name
       if (args.action === 'flash' && typeof args.file === 'string') {
         const parts = args.file.split(/[\\/]/)
         return parts[parts.length - 1]
@@ -494,6 +586,12 @@ window.__ModuleLoader__.load({
 
       const memory = hexdump(t, data.memory)
       if (memory !== null) children.push(h('div', { key: 'mem' }, memory))
+
+      const decoded = decodedValue(t, data)
+      if (decoded !== null) children.push(h('div', { key: 'decoded-wrap' }, decoded))
+
+      const layout = typeLayout(t, data)
+      if (layout !== null) children.push(h('div', { key: 'type-wrap' }, layout))
 
       const log = logLines(data.log)
       if (log !== null) children.push(h('div', { key: 'log' }, log))

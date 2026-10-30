@@ -7,7 +7,17 @@
 ```
 你: 读一下 SystemCoreClock
 agent → read_memory(symbol: "SystemCoreClock")
-     ← 0x20000000 = 0x0EE6B280 = 250,000,000
+     ← 0x0EE6B280 = 250,000,000
+```
+
+结构体也一样，不用自己算偏移：
+
+```
+你: foc_isr 现在什么状态？
+agent → read_memory(symbol: "foc_isr")
+     ← { active_motor: -1, ready: 1, calc_cnt: 57915006, ... }
+agent → type(name: "foc_isr_shared_t")
+     ← 7 个字段：target_pos@0、active_motor@64、calc_cnt@68 ...
 ```
 
 ---
@@ -15,7 +25,7 @@ agent → read_memory(symbol: "SystemCoreClock")
 ## 特性
 
 - **持久调试会话**。一次连接，之后每次读写 1–8 ms，而不是每次 fork 一个 `JLink.exe`（约 250 ms 且拿不到 halt 状态）。
-- **符号解析**。直接解析固件 `.elf` 的 `.symtab`，不用 `nm`/`objdump`/DWARF 工具链。可以 `breakpoint(symbol: "FDCAN_RxLogTask")`、`read_memory(symbol: "uwTick")`、省略长度时自动读整个变量。
+- **符号 + 类型解析**。直接解析固件 `.elf` 的 `.symtab` 和 DWARF 2–5，不依赖 `nm`/`objdump`/`readelf`。`read_memory(symbol: "foc_isr")` 直接给出 `active_motor: -1`、`calc_cnt: ...` 这样的字段值；`type` 打印结构体的字段名、偏移、大小和枚举值。`breakpoint(symbol: "FDCAN_RxLogTask")`、`read_memory(symbol: "uwTick")` 也照常可用。
 - **PC 自动符号化**。`registers` 直接给 `PC=0x080082BC FDCAN_RxLogTask+0`。
 - **按工作区的目标设置**。芯片型号、调试接口、时钟属于某一块板子，所以放在**右侧边栏 → J-Link** 面板里，每个工作区各存一份；`JLink.exe` 路径这类本机设置才留在全局设置页。
 - **器件库里搜索，不用背型号**。MCU 字段直接搜 J-Link 内置器件表（型号、厂商、内核、别名），下拉里还保留这台机器最近 12 个选择。
@@ -50,7 +60,7 @@ pnpm install     # 或 npm install
 
 装完：
 
-- 改了 **Host 代码**（`index.js` / `jlink.js` / `session.js` / `rsp.js` / `elf.js`）→ 在插件管理里关掉再打开，或重启 DSH；
+- 改了 **Host 代码**（`index.js` / `jlink.js` / `session.js` / `rsp.js` / `elf.js` / `dwarf.js`）→ 在插件管理里关掉再打开，或重启 DSH；
 - 改了 **客户端代码**（`client.js` / `locale/*.json`）→ 浏览器按 F5。
 
 ## 配置
@@ -97,7 +107,7 @@ pnpm install     # 或 npm install
         device: STM32H503CB
         interface: SWD
         speedKhz: 4000
-        maxReadBytes: 512
+        maxReadBytes: 1024
 ```
 
 ## 工具
@@ -106,18 +116,19 @@ pnpm install     # 或 npm install
 
 | action | 作用 |
 |---|---|
-| `status` | 探针身份、内核、运行状态、断点列表、当前镜像的符号数 |
+| `status` | 探针身份、内核、运行状态、断点列表、当前镜像的符号数和 DWARF 类型数 |
 | `connect` | 建立持久会话；默认让内核保持运行（`halt: true` 则连上即停） |
 | `disconnect` | 释放探针，Ozone/Keil/JLink.exe 可以接手 |
 | `halt` | 停住内核并报告停下来的原因 |
 | `resume` | 继续运行，遇到断点再停 |
 | `step` | 前进 N 条指令并保持 halt |
 | `registers` | r0–r12、sp、lr、pc、xpsr，附带当前异常号和 `PC` 的函数名 |
-| `read_memory` | 读一段内存 |
+| `read_memory` | 读一段内存；用 `symbol` 时按 DWARF 类型解码成字段值 |
 | `write_memory` | 写十六进制字节到 RAM 或外设空间 |
 | `breakpoint` | 设置（默认）/ 清除硬件断点 |
 | `reset` | 复位内核并停在复位向量 |
-| `symbols` | 从固件 `.elf` 里列出 / 搜索符号 |
+| `symbols` | 从固件 `.elf` 里列出 / 搜索符号，对象附带 DWARF 类型名；`query` 也匹配类型名 |
+| `type` | 打印一个类型或变量的布局：字段名、偏移、大小、枚举值 |
 | `resolve` | 把一个符号名变成地址，查不到时给候选 |
 
 公共参数：
@@ -126,13 +137,14 @@ pnpm install     # 或 npm install
 |---|---|---|
 | `address` | 读/写/断点 | 十六进制或十进制地址，与 `symbol` 二选一 |
 | `symbol` | 读/写/断点 | 符号名，自动处理 Thumb 位 |
-| `length` | 读 | 省略时用该符号自身的大小，再不然 64 |
+| `length` | 读 | 省略时用该符号自身的大小，再不然 64；小于类型大小时只解码读到的前缀 |
 | `bytes` | 写 | 如 `"deadbeef"` 或 `"DE AD BE EF"` |
 | `count` | 单步 | 默认 1 |
 | `clear` | 断点 | `true` 表示清除 |
 | `halt` | connect | `true` 表示连上就停 |
-| `query` / `kind` / `limit` | symbols | 子串过滤 / `func`、`object`、`any` / 返回条数 |
-| `name` | resolve | 要解析的符号名 |
+| `query` / `kind` / `limit` | symbols | 子串过滤（也匹配类型名）/ `func`、`object`、`any` / 返回条数 |
+| `name` | type / resolve | `type` 要查的类型名或变量名；`resolve` 要解析的符号名 |
+| `depth` | type / 读 | 展开多少层嵌套结构体/数组；`type` 默认 2，读默认 4 |
 | `file` | 任意 | 这个 `.elf` 的绝对路径，记到当前工作区 |
 
 ### `mcu_flash`
@@ -149,6 +161,30 @@ pnpm install     # 或 npm install
 
 换工作区不会继承上一个工作区的镜像，所以两个工程来回切时 `PC` 的注释不会串。
 
+## 结构体怎么读
+
+`type` 和 `read_memory` 的类型信息来自同一个 ELF 的 DWARF（`.debug_info`），和符号表一起按 ELF 的 mtime 缓存：
+
+```
+type(name: "FOC_motor_dev")
+→ 22 个字段：motor_id@0、velocity_pid_data@32、status@168 ...
+
+read_memory(symbol: "foc_isr")
+→ value: { target_pos: [0,0,0,0], ..., active_motor: -1, ready: 1, calc_cnt: 53685146 }
+
+symbols(query: "foc_isr_shared_t", kind: "object")
+→ foc_isr  0x20001E90  72 B  object · foc_isr_shared_t
+```
+
+规则：
+
+- 支持 DWARF 2–5、ELF32 小端，覆盖 Arm GCC / clang（ATfE）的常见输出；不依赖外部 `readelf`/`dwarfdump`。
+- 只解码**有静态地址的全局/文件级变量**。局部变量需要位置列表和 frame base，暂不支持。
+- 指针只显示地址，不自动追（避免一次读取变成不可控的指针链）；要读指针目标，用 `resolve` 找到符号或直接 `read_memory(address: ...)`。
+- `char[]` 和可打印的单字节数组按字符串显示，其余数组按数字数组；数组最多展开 64 个元素，超出部分标 `<N more>`。
+- `read_memory` 默认读整个符号。符号比“单次读取上限”大时只解码读到的前缀，结果里 `valuePartial: true`；把上限调大即可读全（例如 `FOC_motor_dev[4]` 是 704 B）。
+- 镜像 strip 掉 DWARF（常见 Release）时，符号/地址/原始字节仍然可用，`type` 会明确报 `.debug_info` 缺失，不会退回半解析。
+
 ## 实测
 
 STM32H503CBU6（Cortex-M33 r0p4）+ J-Link，655 个符号 / 312 个函数 / 50 个全局对象：
@@ -164,6 +200,8 @@ STM32H503CBU6（Cortex-M33 r0p4）+ J-Link，655 个符号 / 312 个函数 / 50 
 | 建立会话 | — | 259 ms（一次性） |
 | 复位 | 73 ms | 73 ms（两边都是目标自身复位主导） |
 | 释放 | — | 3–9 ms |
+
+本机用 MotorTest 的 ATfE-Debug 镜像（71 个 CU / 289 个类型名 / 834 个变量）实测：DWARF 首次解析约 40 ms，之后按 ELF mtime 缓存；读 704 B 的 `motor[4]` 并解码 4 个 `FOC_motor_dev`（每个含 3 个 PID 子结构）仍是一次探针读取。
 
 ## 实现要点
 
@@ -195,17 +233,21 @@ STM32H503CBU6（Cortex-M33 r0p4）+ J-Link，655 个符号 / 312 个函数 / 50 
 | `session.js` | 持久会话：拉起 `JLinkGDBServerCL.exe`、halt/resume/step、断点、内存、FPB 清扫 |
 | `rsp.js` | 最小 GDB RSP 客户端（包分帧、ack、无超时的 `c`、`qRcmd`） |
 | `elf.js` | ELF32 小端符号表解析器，按 mtime 缓存，无第三方依赖 |
-| `client.js` | 客户端半边：对话卡片 + 右侧边栏的 J-Link 标签（含器件搜索下拉）+ 全局设置页 |
+| `dwarf.js` | ELF32 小端 DWARF 2–5 解析器：类型布局、全局变量地址、按类型解码内存，无第三方依赖 |
+| `client.js` | 客户端半边：对话卡片（hexdump、解码后的字段树、类型布局表）+ 右侧边栏的 J-Link 标签（含器件搜索下拉）+ 全局设置页 |
 | `cordis.patch.yml` | 插件行与默认配置 |
 | `locale/*.json` | `meta.title` / `meta.description` |
 | `smoke.mjs` | 开发用的连通性冒烟脚本 |
 | `session-test.mjs` | 开发用的会话回归脚本 |
 | `devices-test.mjs` | 开发用的器件库脚本：导出、解析、缓存、搜索、历史 |
+| `dwarf-test.mjs` | 开发用的 DWARF 脚本：解析 ATfE/GCC 两种 ELF、字段偏移、按类型解码、strip 镜像报错 |
 
 ## 已知限制
 
-- **没有 DWARF**，所以只有"名字 + 地址 + 大小"，拿不到结构体字段名和类型。读一个结构体得到的是整块字节。
-- **只支持 ELF32 小端**（Cortex-M 全系如此）；ELF64 会明确报错而不是半解析。
+- **DWARF 解析只覆盖 C 的全局/文件级变量**：局部变量、内联实例、位置列表不在范围内；`type` 查询类型本身不受影响。
+- **只支持 ELF32 小端 / DWARF32**（Cortex-M 全系如此）；ELF64、DWARF64 会明确报错而不是半解析。split DWARF（`.dwo`/`.dwp`）也不支持。
+- **指针不自动追**：解码结果是地址字符串。要读 `motor[0].moving_angle_ptr` 指向的值，先用 `resolve` 查它指向的符号，或按地址再读一次。
+- **解码输出有上限**：数组最多 64 个元素；`read_memory` 超过“单次读取上限”的符号只解码前缀。
 - **读取仍会短暂 halt**（现在 ~8 ms，对高实时性的控制环仍有扰动）。
 - **没有 watch / 持续采样**，每次调用是一次快照。
 - **没有 RTT**。
@@ -219,6 +261,7 @@ STM32H503CBU6（Cortex-M33 r0p4）+ J-Link，655 个符号 / 312 个函数 / 50 
 node smoke.mjs        # 探针能不能找到、能不能连
 node session-test.mjs # 持久会话回归：halt/step/断点/内存/复位
 node devices-test.mjs # 器件库：导出耗时、解析条数、搜索排名、历史读写
+node dwarf-test.mjs   # DWARF：解析、字段偏移、解码、strip 镜像报错
 ```
 
 改了 Host 代码之后重载插件最快的方式，是在插件管理里关掉再打开——不用重启 DSH。
